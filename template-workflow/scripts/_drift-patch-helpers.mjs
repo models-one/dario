@@ -1,0 +1,262 @@
+/**
+ * Pure helpers used by scripts/auto-draft-drift-fix.mjs. Lives in its
+ * own module so the tests can import the functions without triggering
+ * the main script's top-level "read argv → patch files → emit JSON"
+ * side-effect chain.
+ */
+
+/**
+ * Compare two dotted-numeric version strings. Returns true iff `a` is
+ * strictly older than `b` (semver-ish, no pre-release handling — the
+ * CC versions we compare look like `2.1.118`, no `-rc` suffix so far).
+ */
+export function isOlderThan(a, b) {
+  const pa = a.split('.').map((x) => parseInt(x, 10));
+  const pb = b.split('.').map((x) => parseInt(x, 10));
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] ?? 0;
+    const y = pb[i] ?? 0;
+    if (x < y) return true;
+    if (x > y) return false;
+  }
+  return false;
+}
+
+/**
+ * Patch the `maxTested` property inside a TypeScript source string.
+ * Matches `maxTested: 'X.Y.Z'` or `maxTested: "X.Y.Z"` (either quote
+ * style) and replaces with the new version. Returns:
+ *
+ *   { patched: string | null, before: string | null, after: string }
+ *
+ * `patched === null` when:
+ *   - No `maxTested` property exists in the source (surrounding shape drifted)
+ *   - The current value is NOT older than the requested new value
+ *     (guard against moving backward or redundant writes)
+ */
+export function patchMaxTested(source, _oldVersionFromReport, newVersion) {
+  const re = /(\bmaxTested\s*:\s*['"])([^'"]+)(['"])/;
+  const m = re.exec(source);
+  if (!m) return { patched: null, before: null, after: newVersion };
+  const before = m[2];
+  if (!isOlderThan(before, newVersion)) {
+    return { patched: null, before, after: newVersion };
+  }
+  const patched = source.replace(re, `$1${newVersion}$3`);
+  return { patched, before, after: newVersion };
+}
+
+/**
+ * Insert a bullet line immediately after a CHANGELOG heading. Line-
+ * anchored regex avoids matching string occurrences inside HTML
+ * comments. Default: matches `## [Unreleased]`. Can target a specific
+ * version heading via the `heading` parameter (used by the auto-
+ * release flow, where the heading has just been promoted to
+ * `## [X.Y.Z] - date`).
+ *
+ * Returns the changelog unchanged if the target heading doesn't
+ * exist — the bot isn't aggressive enough to reshape the file.
+ */
+export function appendUnreleased(changelog, bullet, heading = /^## \[Unreleased\]\s*$/m) {
+  const re = typeof heading === 'string' ? new RegExp(`^${escapeRe(heading)}\\s*$`, 'm') : heading;
+  const m = re.exec(changelog);
+  if (!m || typeof m.index !== 'number') return changelog;
+  // Use the heading's START position (m.index) rather than match
+  // length — the regex may greedily consume trailing `\n`s via `\s*`,
+  // which would make `afterHeading` skip past the heading line.
+  const lineEnd = changelog.indexOf('\n', m.index);
+  if (lineEnd === -1) return changelog;
+  const tail = changelog.slice(lineEnd + 1);
+  const insertion = `\n${bullet}\n`;
+  return changelog.slice(0, lineEnd + 1) + insertion + tail;
+}
+
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Bump a dotted-numeric version's LAST component by 1. Pure, returns
+ * a new string. Rejects versions with non-numeric segments. Used by
+ * the auto-drafter to move `3.31.11` → `3.31.12` when producing a
+ * release-ready PR.
+ */
+export function bumpPatch(version) {
+  const parts = version.split('.');
+  if (parts.length < 2) throw new Error(`version must have at least two segments: ${version}`);
+  for (const p of parts) {
+    if (!/^\d+$/.test(p)) throw new Error(`non-numeric segment in version: ${version}`);
+  }
+  const last = parts.length - 1;
+  parts[last] = String(parseInt(parts[last], 10) + 1);
+  return parts.join('.');
+}
+
+/**
+ * Parse a package.json string, bump its `version` field's patch
+ * component, return the updated JSON string. Preserves the original
+ * object shape and two-space indentation (dario's package.json
+ * convention). Throws if `version` isn't present or isn't parseable.
+ */
+export function bumpPackageJsonPatch(pkgJsonString) {
+  const pkg = JSON.parse(pkgJsonString);
+  if (typeof pkg.version !== 'string') {
+    throw new Error('package.json has no version field');
+  }
+  const newVersion = bumpPatch(pkg.version);
+  pkg.version = newVersion;
+  // Preserve trailing newline — dario's package.json has one.
+  return {
+    content: JSON.stringify(pkg, null, 2) + '\n',
+    before: JSON.parse(pkgJsonString).version,
+    after: newVersion,
+  };
+}
+
+/**
+ * Bump the version-LABEL fields of a baked `cc-template-data.json` *text* to
+ * a new CC version, leaving the wire shape (tools, system_prompt, headers,
+ * anthropic_beta, field orders) byte-for-byte untouched.
+ *
+ * Operates on the raw JSON text via anchored replacements — NOT
+ * parse→stringify — so the resulting git diff is exactly the three label
+ * lines. That surgical diff is what makes the cc-drift-template-watch
+ * label-sync path safe to AUTO-MERGE: a reviewer (or branch protection) can
+ * see at a glance that only version strings moved.
+ *
+ * Touches, and only:
+ *   - `_version`                    — what check-sdk-drift.mjs compares vs npm
+ *   - `_supportedMaxTested`         — drives live-fingerprint's "installed CC
+ *                                     newer than tested" startup warning
+ *   - `header_values['user-agent']` — only the `claude-cli/<v>` version token
+ *
+ * Deliberately does NOT touch `_captured` (honest "last real capture" stamp)
+ * or `x-stainless-package-version` (not version-coupled; flagged on its own
+ * if it ever drifts).
+ *
+ * Returns `{ text, before, after }`. Throws if `target` isn't dotted-numeric,
+ * isn't strictly newer than the current `_version`, or if any of the three
+ * anchored fields fails to match — a no-op replace means the template shape
+ * drifted out from under us, so fail loud rather than silently ship a
+ * half-bumped label (the silent-no-op failure mode the hand path keeps hitting).
+ */
+export function bumpTemplateLabels(jsonText, target) {
+  if (typeof target !== 'string' || !/^\d+(?:\.\d+)+$/.test(target)) {
+    throw new Error(`target version must be dotted-numeric, got: ${JSON.stringify(target)}`);
+  }
+  const current = JSON.parse(jsonText)._version;
+  if (typeof current !== 'string') {
+    throw new Error('template JSON has no string _version field');
+  }
+  if (!isOlderThan(current, target)) {
+    throw new Error(`refusing to bump _version ${current} → ${target} (not strictly newer)`);
+  }
+
+  // Each sub is (label, anchored-regex). Group 1 + group 2 wrap the version
+  // token so the replacement only swaps the version, preserving quoting,
+  // spacing, and (for user-agent) the ` (external, sdk-cli)` suffix.
+  const subs = [
+    ['_version', /("_version":\s*")[^"]+(")/],
+    ['_supportedMaxTested', /("_supportedMaxTested":\s*")[^"]+(")/],
+    ['user-agent', /("user-agent":\s*"claude-cli\/)\d+(?:\.\d+)+(\s[^"]*")/],
+  ];
+
+  let text = jsonText;
+  for (const [name, re] of subs) {
+    if (!re.test(text)) {
+      throw new Error(`label field not found (template shape drifted?): ${name}`);
+    }
+    text = text.replace(re, `$1${target}$2`);
+  }
+  return { text, before: current, after: target };
+}
+
+/**
+ * Promote the current `## [Unreleased]` section to a dated version
+ * heading and insert a fresh `## [Unreleased]` above it. Mirrors the
+ * CHANGELOG convention documented in the top-of-file HTML comment
+ * (introduced in v3.31.10): at release time, rename Unreleased to
+ * `## [X.Y.Z] - YYYY-MM-DD` and open a new Unreleased above.
+ *
+ * If the changelog has no `## [Unreleased]` heading, returns unchanged.
+ */
+export function promoteUnreleased(changelog, newVersion, date) {
+  // Match the heading line only, not its line break, so the blank line under
+  // it stays with the promoted section. The lookahead leaves a CRLF file's
+  // `\r` in place.
+  const re = /^## \[Unreleased\][ \t]*(?=\r?$)/m;
+  const m = re.exec(changelog);
+  if (!m || typeof m.index !== 'number') return changelog;
+  const before = changelog.slice(0, m.index);
+  const after = changelog.slice(m.index + m[0].length);
+  const dated = `## [Unreleased]\n\n## [${newVersion}] - ${date}`;
+  return before + dated + after;
+}
+
+/**
+ * Mirror a version into `package-lock.json`'s two version slots (root
+ * `.version` and `.packages[""].version`), returning the updated JSON text.
+ *
+ * The lockfile carries the package version twice, and `scripts/preflight.mjs`
+ * (run by the required `validate-package-json` check) fails when either slot
+ * disagrees with package.json. Every bot that bumps package.json must bump the
+ * lockfile in the same commit or its own PR goes red on a defect it introduced
+ * — exactly what happened to the drift PR that produced this helper
+ * (`package-lock.json: version 5.5.70 ≠ package.json 5.5.71`).
+ *
+ * A plain version bump does NOT change the dependency graph, so re-resolving
+ * with `npm install --package-lock-only` is unnecessary: these two slots
+ * MIRROR package.json by definition. Writing the version into them is
+ * derivation, not a guess — the same reasoning renumber-release-version.mjs
+ * spells out for its own lockfile write.
+ *
+ * Slots that are absent are left alone rather than invented. Throws if the
+ * text isn't parseable JSON, so a corrupt lockfile fails loud instead of
+ * being silently skipped.
+ */
+export function syncLockfileVersion(lockJsonString, version) {
+  if (typeof version !== 'string' || !/^\d+(?:\.\d+)+$/.test(version)) {
+    throw new Error(`version must be dotted-numeric, got: ${JSON.stringify(version)}`);
+  }
+  const lock = JSON.parse(lockJsonString);
+  if (typeof lock.version === 'string') lock.version = version;
+  if (lock.packages && lock.packages[''] && typeof lock.packages[''].version === 'string') {
+    lock.packages[''].version = version;
+  }
+  return JSON.stringify(lock, null, 2) + '\n';
+}
+
+/**
+ * Build the user-facing summary for an automated compatibility update. pinnedTest says whether
+ * test/compat-pinned.json lists ccVersion, and changelogEntry whether CHANGELOG.md was given an
+ * entry for newDarioVersion; the body claims neither unless it is true.
+ */
+export function buildPrBody(ccVersion, before, newDarioVersion, pinnedTest, changelogEntry) {
+  const pkg = changelogEntry
+    ? `The package version is ${newDarioVersion} and the changelog has an entry for it`
+    : `The package version is ${newDarioVersion}, but the changelog could not be updated and has no entry for it`;
+  return [
+    `Claude Code ${ccVersion} is now in \`SUPPORTED_CC_RANGE\` (the ceiling was ${before}), so \`dario doctor\` and proxy startup no longer warn that it is untested.`,
+    '',
+    pinnedTest
+      ? `${pkg}; \`test/compat-pinned.json\` lists ${ccVersion}, so \`test/compat-range.mjs\` checks it stays supported.`
+      : `${pkg}; ${ccVersion} is not in \`test/compat-pinned.json\`, so this PR does not guard against the bump being reverted.`,
+  ].join('\n');
+}
+
+/**
+ * Add a newly supported Claude Code version to test/compat-pinned.json, the list test/compat-range.mjs
+ * checks is inside the tested range. The range case reads maxTested itself, so it still passes with
+ * the bump reverted; a listed version does not. Returns the new file text (the text unchanged when
+ * the version is already listed), or null when the version is not x.y.z or the text is not a JSON
+ * list of version strings.
+ */
+export function addPinnedVersion(jsonText, version) {
+  const isVersion = (v) => typeof v === 'string' && /^\d+\.\d+\.\d+$/.test(v);
+  if (!isVersion(version)) return null;
+  let list;
+  try { list = JSON.parse(jsonText); } catch { return null; }
+  if (!Array.isArray(list) || !list.every(isVersion)) return null;
+  if (list.includes(version)) return jsonText;
+  return JSON.stringify([...list, version], null, 2) + '\n';
+}

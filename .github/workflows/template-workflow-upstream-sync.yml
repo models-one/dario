@@ -1,0 +1,40 @@
+name: Template Workflow upstream-sync
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+defaults:
+  run:
+    shell: bash
+    working-directory: template-workflow
+env:
+  TEMPLATE_CAPTURE_WORKFLOW: template-workflow-capture.yml
+  TEMPLATE_CI_WORKFLOW: template-workflow-ci.yml
+permissions:
+  contents: read
+concurrency:
+  group: template-workflow-maintenance
+  cancel-in-progress: false
+jobs:
+  upstream-sync:
+    if: github.repository == 'models-one/dario'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.CC_DRIFT_BOT_PAT || secrets.GITHUB_TOKEN }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      TEMPLATE_AUTO_MERGE: ${{ vars.TEMPLATE_AUTO_MERGE }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.CC_DRIFT_BOT_PAT || secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - run: node scripts/automation.mjs upstream

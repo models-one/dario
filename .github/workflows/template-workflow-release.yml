@@ -1,0 +1,48 @@
+name: Template Workflow release
+on:
+  push:
+    branches: [master]
+    paths:
+      - template-workflow/reference/cc-template-data.json
+      - template-workflow/upstream-snapshot.json
+      - .github/workflows/template-workflow-release.yml
+  workflow_dispatch:
+defaults:
+  run:
+    shell: bash
+    working-directory: template-workflow
+env:
+  TEMPLATE_CAPTURE_WORKFLOW: template-workflow-capture.yml
+  TEMPLATE_CI_WORKFLOW: template-workflow-ci.yml
+permissions:
+  contents: write
+concurrency:
+  group: template-workflow-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build
+      - run: npm run verify:upstream
+      - run: npm test
+      - run: npm run export
+      - name: Publish immutable versioned files
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json")).version')
+          tag="template-workflow-v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving its immutable artifact unchanged."
+            exit 0
+          fi
+          gh release create "$tag" artifacts/official/cc-template-data.json artifacts/official/metadata.json artifacts/official/SHA256SUMS --target "$GITHUB_SHA" --title "Template workflow $version" --notes-file CHANGELOG.md

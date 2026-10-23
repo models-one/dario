@@ -1,0 +1,14 @@
+import ts from 'typescript';
+import { copyFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+const reference = new URL('../test/reference/dario/', import.meta.url);
+const configPath = fileURLToPath(new URL('tsconfig.json', reference));
+const config = ts.readConfigFile(configPath, ts.sys.readFile);
+if (config.error) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
+const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, fileURLToPath(reference));
+const program = ts.createProgram(parsed.fileNames, parsed.options);
+const output = program.emit();
+const errors = [...ts.getPreEmitDiagnostics(program), ...output.diagnostics].filter((d) => d.category === ts.DiagnosticCategory.Error);
+if (errors.length) throw new Error(ts.formatDiagnosticsWithColorAndContext(errors, { getCurrentDirectory: ts.sys.getCurrentDirectory, getCanonicalFileName: (p) => p, getNewLine: () => '\n' }));
+copyFileSync(new URL('src/cc-template-data.json', reference), new URL('dist/cc-template-data.json', reference));
+console.log('Built the unmodified Dario reference for parity tests.');

@@ -1,0 +1,224 @@
+{
+  "repository": "askalf/dario",
+  "commit": "15d269e3b49c681c1ab3e53af2e5181f01c71619",
+  "officialTemplate": {
+    "path": "reference/cc-template-data.json",
+    "ccVersion": "2.1.306",
+    "bytes": 163943,
+    "sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f"
+  },
+  "files": {
+    "LICENSE": {
+      "source_path": "LICENSE",
+      "source_sha256": "66e53fc058687c4969b12910b8cc7a3d57384d21e8af40175f8a23c41810b1d6",
+      "local_sha256": "66e53fc058687c4969b12910b8cc7a3d57384d21e8af40175f8a23c41810b1d6"
+    },
+    "tsconfig.json": {
+      "source_path": "tsconfig.json",
+      "source_sha256": "e2bc26d3ae5507505ef1b9db35dd5a6b963752fa90bf862b0464c0ddd1d87465",
+      "local_sha256": "e2bc26d3ae5507505ef1b9db35dd5a6b963752fa90bf862b0464c0ddd1d87465"
+    },
+    "src/live-fingerprint.ts": {
+      "source_path": "src/live-fingerprint.ts",
+      "source_sha256": "3dd5396a42d503b0f6e7f3165fd01b7ac86ffedea093621fcd9ec8422500ae6f",
+      "local_sha256": "3dd5396a42d503b0f6e7f3165fd01b7ac86ffedea093621fcd9ec8422500ae6f",
+      "maxTested": "2.1.309",
+      "normalized_sha256": "d808d5c7ef7442e675310c24037eac9375017ac6a68075af598fdef1319dc780"
+    },
+    "src/scrub-template.ts": {
+      "source_path": "src/scrub-template.ts",
+      "source_sha256": "34d5a0fc01d5d6652b274852335a2d2d6b0a147c56d8cce17cf1f0a75c849d5b",
+      "local_sha256": "34d5a0fc01d5d6652b274852335a2d2d6b0a147c56d8cce17cf1f0a75c849d5b"
+    },
+    "src/cc-oauth-detect.ts": {
+      "source_path": "src/cc-oauth-detect.ts",
+      "source_sha256": "596c20b9b9f437206bdcf54a1c12f455352bf55c63b9adf92d7b9813a9c19695",
+      "local_sha256": "596c20b9b9f437206bdcf54a1c12f455352bf55c63b9adf92d7b9813a9c19695"
+    },
+    "src/cch.ts": {
+      "source_path": "src/cch.ts",
+      "source_sha256": "3e218212ab7aeef5af31ecaa2fd90ecae8922a2208e114714a3d78ab6ba8b8cc",
+      "local_sha256": "3e218212ab7aeef5af31ecaa2fd90ecae8922a2208e114714a3d78ab6ba8b8cc"
+    },
+    "src/cc-template-data.json": {
+      "source_path": "src/cc-template-data.json",
+      "source_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f",
+      "local_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f",
+      "mutable": "local observation baseline; official delivery uses reference/cc-template-data.json"
+    },
+    "scripts/capture-and-bake.mjs": {
+      "source_path": "scripts/capture-and-bake.mjs",
+      "source_sha256": "ee0333c98b4967459a6a8d334b81460526a0323f3a59c679f5966e95f2761f3c",
+      "local_sha256": "86b3f7c4785b40ad59acad75b9bf27e1b8b831e9d9f95d4b21992ed687004515",
+      "change": "Import preservation constants from their defining module; verified against the original bake by replay."
+    },
+    "scripts/drift-report.mjs": {
+      "source_path": "scripts/drift-report.mjs",
+      "source_sha256": "f4bba1d0161d90b3528110c0ab25a66c0d026a8c170df6a649d21c8c23d32061",
+      "local_sha256": "f4bba1d0161d90b3528110c0ab25a66c0d026a8c170df6a649d21c8c23d32061"
+    },
+    "scripts/label-sync.mjs": {
+      "source_path": "scripts/label-sync.mjs",
+      "source_sha256": "c3da8fd5b3f64cdb5b55a28ee0c3ba36f7d42c80b2988443b6ef31fcd86637d2",
+      "local_sha256": "c3da8fd5b3f64cdb5b55a28ee0c3ba36f7d42c80b2988443b6ef31fcd86637d2"
+    },
+    "scripts/rebake-release-prep.mjs": {
+      "source_path": "scripts/rebake-release-prep.mjs",
+      "source_sha256": "efc0f6110d1c66a7ac319db732ffa6585b66a84986aa1d9d20cfb603f5918c7e",
+      "local_sha256": "7f768537064ebe6b17e414f3046c95aa636e7568cbeddce9c0840845a6d9dd28",
+      "change": "Use producer-relative Git paths for the committed baseline in nested repositories."
+    },
+    "scripts/check-rebake-content.mjs": {
+      "source_path": "scripts/check-rebake-content.mjs",
+      "source_sha256": "75c56bf4f2343931e9c6a2c3a30c1447d97dcfe19edfc14190c197661abb492b",
+      "local_sha256": "4b46335a3da8f90ce532dcb9eee49eaa7be254c2a9f9cd14d0dbd50306460799",
+      "change": "Use producer-relative Git paths for the committed baseline in nested repositories."
+    },
+    "scripts/rebake-pr-action.mjs": {
+      "source_path": "scripts/rebake-pr-action.mjs",
+      "source_sha256": "cce7ea2156f68c459c5c4625059c3d6ae9d3e9417da3cf67532fb1b4ac55ab98",
+      "local_sha256": "cce7ea2156f68c459c5c4625059c3d6ae9d3e9417da3cf67532fb1b4ac55ab98"
+    },
+    "scripts/_drift-patch-helpers.mjs": {
+      "source_path": "scripts/_drift-patch-helpers.mjs",
+      "source_sha256": "c7675f4e8a5642bf6ef02bafc9cf386231e0225fcec6dac5326cf99db556c0e6",
+      "local_sha256": "c7675f4e8a5642bf6ef02bafc9cf386231e0225fcec6dac5326cf99db556c0e6"
+    },
+    "scripts/check-cc-drift.mjs": {
+      "source_path": "scripts/check-cc-drift.mjs",
+      "source_sha256": "ea8aeb0e91cc0ae75072d0b1de403ffd4fc13a3709cda08e0b252c228afaccc9",
+      "local_sha256": "ea8aeb0e91cc0ae75072d0b1de403ffd4fc13a3709cda08e0b252c228afaccc9"
+    },
+    "scripts/auto-draft-drift-fix.mjs": {
+      "source_path": "scripts/auto-draft-drift-fix.mjs",
+      "source_sha256": "633bc294401f11440834f3b5140172f191171c112be7ea03afe5e3d0951bd617",
+      "local_sha256": "633bc294401f11440834f3b5140172f191171c112be7ea03afe5e3d0951bd617"
+    },
+    "scripts/close-superseded-drift-prs.mjs": {
+      "source_path": "scripts/close-superseded-drift-prs.mjs",
+      "source_sha256": "72e233c502c26c21d70be865bc1819fbec93d1866ca8f9575c0c0d07f5ee73dc",
+      "local_sha256": "72e233c502c26c21d70be865bc1819fbec93d1866ca8f9575c0c0d07f5ee73dc"
+    },
+    "test/live-fingerprint.mjs": {
+      "source_path": "test/live-fingerprint.mjs",
+      "source_sha256": "853f48b7aff26a33ceedab26a0460d6e516dd056f14903f71721104f7c3b5752",
+      "local_sha256": "853f48b7aff26a33ceedab26a0460d6e516dd056f14903f71721104f7c3b5752"
+    },
+    "test/scrub-template.mjs": {
+      "source_path": "test/scrub-template.mjs",
+      "source_sha256": "9628e3c7f8ece3dbe87ac5bfb6c22b15b4a192aafa012d3674478429f9b22e70",
+      "local_sha256": "9628e3c7f8ece3dbe87ac5bfb6c22b15b4a192aafa012d3674478429f9b22e70"
+    },
+    "test/capture-provenance.mjs": {
+      "source_path": "test/capture-provenance.mjs",
+      "source_sha256": "787f6d1ba2a408c0803ebb0f228cc4265f42df4e2fad96fa79c9820fd3b5dbb5",
+      "local_sha256": "787f6d1ba2a408c0803ebb0f228cc4265f42df4e2fad96fa79c9820fd3b5dbb5"
+    },
+    "test/drift-detection.mjs": {
+      "source_path": "test/drift-detection.mjs",
+      "source_sha256": "f2167299b69b8c349d74e1da1c1a34e914a782a7dbe7f402e8b3381304f4e132",
+      "local_sha256": "f2167299b69b8c349d74e1da1c1a34e914a782a7dbe7f402e8b3381304f4e132"
+    },
+    "test/compat-range.mjs": {
+      "source_path": "test/compat-range.mjs",
+      "source_sha256": "34ebc3b5ab4ac86254eec496418e064735ae4f83f6e8517e3014d8c149e45f41",
+      "local_sha256": "34ebc3b5ab4ac86254eec496418e064735ae4f83f6e8517e3014d8c149e45f41"
+    },
+    "test/bake-drift-report.mjs": {
+      "source_path": "test/bake-drift-report.mjs",
+      "source_sha256": "5f7365df4bdd45daedd868d877b60e800555a8027a6312fc1b8ffe9ab5706c82",
+      "local_sha256": "5f7365df4bdd45daedd868d877b60e800555a8027a6312fc1b8ffe9ab5706c82"
+    },
+    "test/label-sync.mjs": {
+      "source_path": "test/label-sync.mjs",
+      "source_sha256": "5476615319a3e62d3cc54166415922c04d8ec120a03a733b0509f28fb63a2b2c",
+      "local_sha256": "5476615319a3e62d3cc54166415922c04d8ec120a03a733b0509f28fb63a2b2c"
+    },
+    "test/auto-draft-drift-fix.mjs": {
+      "source_path": "test/auto-draft-drift-fix.mjs",
+      "source_sha256": "94e618d8b4c41b538ff5ad3c99651435f25f092d830c359378b4869999cc7676",
+      "local_sha256": "94e618d8b4c41b538ff5ad3c99651435f25f092d830c359378b4869999cc7676"
+    },
+    "test/close-superseded-drift-prs.mjs": {
+      "source_path": "test/close-superseded-drift-prs.mjs",
+      "source_sha256": "7be03dc6c7727ae40b6787cf97bf0394dfb5836d159ae63d29f0f6e68087236e",
+      "local_sha256": "7be03dc6c7727ae40b6787cf97bf0394dfb5836d159ae63d29f0f6e68087236e"
+    },
+    "reference/cc-template-data.json": {
+      "source_path": "src/cc-template-data.json",
+      "source_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f",
+      "local_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f"
+    },
+    "test/reference/dario/package.json": {
+      "source_path": "package.json",
+      "source_sha256": "41196c15dcce4d52cf73afd1f1c5e40bcd2d04ea07c6a846d454dc10ca1ee35f",
+      "local_sha256": "41196c15dcce4d52cf73afd1f1c5e40bcd2d04ea07c6a846d454dc10ca1ee35f"
+    },
+    "test/reference/dario/tsconfig.json": {
+      "source_path": "tsconfig.json",
+      "source_sha256": "e2bc26d3ae5507505ef1b9db35dd5a6b963752fa90bf862b0464c0ddd1d87465",
+      "local_sha256": "e2bc26d3ae5507505ef1b9db35dd5a6b963752fa90bf862b0464c0ddd1d87465"
+    },
+    "test/reference/dario/src/live-fingerprint.ts": {
+      "source_path": "src/live-fingerprint.ts",
+      "source_sha256": "3dd5396a42d503b0f6e7f3165fd01b7ac86ffedea093621fcd9ec8422500ae6f",
+      "local_sha256": "3dd5396a42d503b0f6e7f3165fd01b7ac86ffedea093621fcd9ec8422500ae6f"
+    },
+    "test/reference/dario/src/scrub-template.ts": {
+      "source_path": "src/scrub-template.ts",
+      "source_sha256": "34d5a0fc01d5d6652b274852335a2d2d6b0a147c56d8cce17cf1f0a75c849d5b",
+      "local_sha256": "34d5a0fc01d5d6652b274852335a2d2d6b0a147c56d8cce17cf1f0a75c849d5b"
+    },
+    "test/reference/dario/src/cc-template.ts": {
+      "source_path": "src/cc-template.ts",
+      "source_sha256": "9d393f8e2e87056d96ca7bc2fdd237330e24e83d262c77a3c6038599cc1cc965",
+      "local_sha256": "9d393f8e2e87056d96ca7bc2fdd237330e24e83d262c77a3c6038599cc1cc965"
+    },
+    "test/reference/dario/src/effort.ts": {
+      "source_path": "src/effort.ts",
+      "source_sha256": "36ca38d1c0ac8cf322cb71a58156e1404c4ab2a306cb01734101d9053cc61950",
+      "local_sha256": "36ca38d1c0ac8cf322cb71a58156e1404c4ab2a306cb01734101d9053cc61950"
+    },
+    "test/reference/dario/src/cc-template-data.json": {
+      "source_path": "src/cc-template-data.json",
+      "source_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f",
+      "local_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f"
+    },
+    "test/reference/dario/scripts/capture-and-bake.mjs": {
+      "source_path": "scripts/capture-and-bake.mjs",
+      "source_sha256": "ee0333c98b4967459a6a8d334b81460526a0323f3a59c679f5966e95f2761f3c",
+      "local_sha256": "ee0333c98b4967459a6a8d334b81460526a0323f3a59c679f5966e95f2761f3c"
+    },
+    "test/reference/dario/scripts/drift-report.mjs": {
+      "source_path": "scripts/drift-report.mjs",
+      "source_sha256": "f4bba1d0161d90b3528110c0ab25a66c0d026a8c170df6a649d21c8c23d32061",
+      "local_sha256": "f4bba1d0161d90b3528110c0ab25a66c0d026a8c170df6a649d21c8c23d32061"
+    },
+    "test/reference/dario/scripts/label-sync.mjs": {
+      "source_path": "scripts/label-sync.mjs",
+      "source_sha256": "c3da8fd5b3f64cdb5b55a28ee0c3ba36f7d42c80b2988443b6ef31fcd86637d2",
+      "local_sha256": "c3da8fd5b3f64cdb5b55a28ee0c3ba36f7d42c80b2988443b6ef31fcd86637d2"
+    },
+    "test/reference/dario/scripts/_drift-patch-helpers.mjs": {
+      "source_path": "scripts/_drift-patch-helpers.mjs",
+      "source_sha256": "c7675f4e8a5642bf6ef02bafc9cf386231e0225fcec6dac5326cf99db556c0e6",
+      "local_sha256": "c7675f4e8a5642bf6ef02bafc9cf386231e0225fcec6dac5326cf99db556c0e6"
+    },
+    "test/reference/dario/test/template-deferred-tools.mjs": {
+      "source_path": "test/template-deferred-tools.mjs",
+      "source_sha256": "fb3e1625e85e1839bd8a3bc637ce1d7fb9f17631f08f90b2f09be9700aced9eb",
+      "local_sha256": "fb3e1625e85e1839bd8a3bc637ce1d7fb9f17631f08f90b2f09be9700aced9eb"
+    },
+    "test/reference/dario/test/template-defer-loading.mjs": {
+      "source_path": "test/template-defer-loading.mjs",
+      "source_sha256": "e70c1291774c56eac8c0b2c3830877c9cda4313c4f3a961cc17c60ee742c9bd7",
+      "local_sha256": "e70c1291774c56eac8c0b2c3830877c9cda4313c4f3a961cc17c60ee742c9bd7"
+    },
+    "test/compat-pinned.json": {
+      "source_path": "test/compat-pinned.json",
+      "source_sha256": "5984c5d3112ce71ac8c4614513eda67ceca594215c4ebc5c9f909e45dbcf1983",
+      "local_sha256": "5984c5d3112ce71ac8c4614513eda67ceca594215c4ebc5c9f909e45dbcf1983",
+      "mutable": "version regression data updated by the upstream drift drafter"
+    }
+  }
+}

@@ -1,0 +1,167 @@
+// Unit tests for the CC version compat matrix (v3.17):
+//   - compareVersions: dotted-numeric comparator with prerelease suffix
+//   - checkCCCompat: below-min / ok / untested-above / unknown branches
+//
+// Both are pure functions. `checkCCCompat` accepts an injected installed
+// version so tests don't depend on having `claude` on PATH.
+
+import {
+  SUPPORTED_CC_RANGE,
+  compareVersions,
+  checkCCCompat,
+} from '../dist/live-fingerprint.js';
+import { readFileSync } from 'node:fs';
+
+let pass = 0, fail = 0;
+function check(label, cond) {
+  if (cond) { console.log(`  ✅ ${label}`); pass++; }
+  else { console.log(`  ❌ ${label}`); fail++; }
+}
+function header(label) {
+  console.log(`\n======================================================================`);
+  console.log(`  ${label}`);
+  console.log(`======================================================================`);
+}
+
+// ======================================================================
+//  compareVersions — numeric prefix
+// ======================================================================
+header('compareVersions — dotted-numeric prefix');
+{
+  check('1.0.0 < 2.0.0', compareVersions('1.0.0', '2.0.0') < 0);
+  check('2.0.0 > 1.9.99', compareVersions('2.0.0', '1.9.99') > 0);
+  check('2.1.104 == 2.1.104', compareVersions('2.1.104', '2.1.104') === 0);
+  check('2.1.104 < 2.1.105', compareVersions('2.1.104', '2.1.105') < 0);
+  check('2.1.104 < 2.2.0', compareVersions('2.1.104', '2.2.0') < 0);
+  check('3.0.0 > 2.99.99', compareVersions('3.0.0', '2.99.99') > 0);
+  // Different length — missing component treated as 0
+  check('2.1 == 2.1.0', compareVersions('2.1', '2.1.0') === 0);
+  check('2.1.1 > 2.1', compareVersions('2.1.1', '2.1') > 0);
+}
+
+// ======================================================================
+//  compareVersions — suffix / prerelease handling
+// ======================================================================
+header('compareVersions — prerelease suffix tiebreaker');
+{
+  // Release beats prerelease at the same numeric version.
+  check('2.1.104 > 2.1.104-beta', compareVersions('2.1.104', '2.1.104-beta') > 0);
+  check('2.1.104-beta < 2.1.104', compareVersions('2.1.104-beta', '2.1.104') < 0);
+  // Lex compare between two suffixes at the same numeric version.
+  check('2.1.104-alpha < 2.1.104-beta', compareVersions('2.1.104-alpha', '2.1.104-beta') < 0);
+  check('2.1.104-beta == 2.1.104-beta', compareVersions('2.1.104-beta', '2.1.104-beta') === 0);
+  // Numeric prefix still dominates over suffix.
+  check('2.2.0-alpha > 2.1.999', compareVersions('2.2.0-alpha', '2.1.999') > 0);
+}
+
+// ======================================================================
+//  checkCCCompat — branches
+// ======================================================================
+header('checkCCCompat — unknown when probe returned null');
+{
+  const r = checkCCCompat(null);
+  check('status = unknown', r.status === 'unknown');
+  check('installedVersion propagates as null', r.installedVersion === null);
+  check('range echoed', r.range.min === SUPPORTED_CC_RANGE.min && r.range.maxTested === SUPPORTED_CC_RANGE.maxTested);
+  check('message mentions "unchecked"', r.message.toLowerCase().includes('unchecked'));
+}
+
+header('checkCCCompat — below-min');
+{
+  const r = checkCCCompat('0.9.0');
+  check('status = below-min', r.status === 'below-min');
+  check('message names installed version', r.message.includes('0.9.0'));
+  check('message names the floor', r.message.includes(SUPPORTED_CC_RANGE.min));
+  check('message hints at upgrade', r.message.toLowerCase().includes('upgrade'));
+}
+
+header('checkCCCompat — ok (inside the tested range)');
+{
+  const r = checkCCCompat(SUPPORTED_CC_RANGE.maxTested);
+  check('status = ok at maxTested', r.status === 'ok');
+  check('installed echoed', r.installedVersion === SUPPORTED_CC_RANGE.maxTested);
+
+  const rMin = checkCCCompat(SUPPORTED_CC_RANGE.min);
+  check('status = ok at min boundary', rMin.status === 'ok');
+}
+
+header('checkCCCompat — 2.1.301 is inside the tested range');
+{
+  // Pinned literal: Claude Code 2.1.301 was e2e-tested and must stay `ok`.
+  // Later bumps may raise maxTested past it, so only a floor is asserted.
+  const r = checkCCCompat('2.1.301');
+  check('status = ok at 2.1.301', r.status === 'ok');
+  check('maxTested is at least 2.1.301', compareVersions(r.range.maxTested, '2.1.301') >= 0);
+}
+
+header('checkCCCompat — 2.1.304 is inside the tested range');
+{
+  // Pinned literal: Claude Code 2.1.304 was e2e-tested and must stay `ok`.
+  // Later bumps may raise maxTested past it, so only a floor is asserted.
+  const r = checkCCCompat('2.1.304');
+  check('status = ok at 2.1.304', r.status === 'ok');
+  check('maxTested is at least 2.1.304', compareVersions(r.range.maxTested, '2.1.304') >= 0);
+}
+
+header('checkCCCompat — 2.1.305 is inside the tested range');
+{
+  // Pinned literal: Claude Code 2.1.305 was e2e-tested and must stay `ok`.
+  // Later bumps may raise maxTested past it, so only a floor is asserted.
+  const r = checkCCCompat('2.1.305');
+  check('status = ok at 2.1.305', r.status === 'ok');
+  check('installed echoed as 2.1.305', r.installedVersion === '2.1.305');
+  check('maxTested is at least 2.1.305', compareVersions(r.range.maxTested, '2.1.305') >= 0);
+}
+
+header('checkCCCompat — 2.1.308 is inside the tested range');
+{
+  // Pinned literal: Claude Code 2.1.308 was e2e-tested and must stay `ok`.
+  // Later bumps may raise maxTested past it, so only a floor is asserted.
+  const r = checkCCCompat('2.1.308');
+  check('status = ok at 2.1.308', r.status === 'ok');
+  check('installed echoed as 2.1.308', r.installedVersion === '2.1.308');
+  check('maxTested is at least 2.1.308', compareVersions(r.range.maxTested, '2.1.308') >= 0);
+}
+
+header('checkCCCompat: 2.1.309 is inside the tested range');
+{
+  // Pinned literal: Claude Code 2.1.309 was e2e-tested and must stay `ok`.
+  // Later bumps may raise maxTested past it, so only a floor is asserted.
+  const r = checkCCCompat('2.1.309');
+  check('status = ok at 2.1.309', r.status === 'ok');
+  check('installed echoed as 2.1.309', r.installedVersion === '2.1.309');
+  check('maxTested is at least 2.1.309', compareVersions(r.range.maxTested, '2.1.309') >= 0);
+}
+
+header('checkCCCompat — untested-above');
+{
+  // Bump a major above maxTested to guarantee "above" regardless of what
+  // the current maxTested constant is.
+  const future = '99.0.0';
+  const r = checkCCCompat(future);
+  check('status = untested-above', r.status === 'untested-above');
+  check('message names installed version', r.message.includes(future));
+  check('message names maxTested', r.message.includes(SUPPORTED_CC_RANGE.maxTested));
+  check('message softens ("usually fine")', r.message.toLowerCase().includes('usually fine'));
+}
+
+header('checkCCCompat: every version in compat-pinned.json is inside the tested range');
+{
+  // The cc-drift drafter adds each version it brings into the supported range. The range case
+  // reads maxTested itself, so it still passes with a bump reverted; a listed version does not.
+  const pinned = JSON.parse(readFileSync(new URL('./compat-pinned.json', import.meta.url), 'utf8'));
+  check('compat-pinned.json is a non-empty list', Array.isArray(pinned) && pinned.length > 0);
+  for (const v of pinned) {
+    const r = checkCCCompat(v);
+    check(`status = ok at ${v}`, r.status === 'ok');
+    check(`maxTested is at least ${v}`, compareVersions(r.range.maxTested, v) >= 0);
+  }
+}
+
+// ======================================================================
+//  Summary
+// ======================================================================
+console.log(`\n======================================================================`);
+console.log(`  Results: ${pass} passed, ${fail} failed`);
+console.log(`======================================================================\n`);
+if (fail > 0) process.exit(1);

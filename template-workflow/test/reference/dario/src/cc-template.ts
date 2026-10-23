@@ -1,0 +1,2963 @@
+/**
+ * Claude Code request template.
+ *
+ * Tool definitions, system prompt, and request structure are loaded from
+ * the live fingerprint cache (captured from the user's own CC install at
+ * dario startup) or from the bundled cc-template-data.json snapshot. The
+ * live cache self-heals when Anthropic ships a new CC version — no user
+ * action required. See src/live-fingerprint.ts for the capture pipeline.
+ */
+
+import {
+  loadTemplate, promptVariantsOf, TemplateData, VARIANT_FAMILIES,
+  PLATFORM_ONLY_TOOLS, INTERACTIVE_ONLY_TOOLS, CONFIG_SCOPED_TOOLS, DEFERRED_TOOLS,
+} from './live-fingerprint.js';
+import { VALID_EFFORT_VALUES, parseEffortSuffix, type EffortValue } from './effort.js';
+
+// Re-exported so existing importers (scripts/capture-and-bake.mjs, the template
+// invariant tests) keep their import site. The definitions live in
+// live-fingerprint.ts because loadTemplate must apply the same superset rule to
+// a live capture that the bake applies to the bundle, and cc-template.ts is
+// downstream of that load (#1035).
+export { PLATFORM_ONLY_TOOLS, INTERACTIVE_ONLY_TOOLS, CONFIG_SCOPED_TOOLS, DEFERRED_TOOLS };
+
+// Load template at module init — prefer live cache, fall back to bundled.
+const TEMPLATE: TemplateData = loadTemplate({ silent: true });
+
+/** The loaded template itself — source, version, capture age, all fields. Startup banners and drift checks read this directly. */
+export const CC_TEMPLATE: TemplateData = TEMPLATE;
+
+/** Keep tool `t` unless its name is listed under a platform other than the current one. */
+export function filterToolsForPlatform<T extends { name: string }>(
+  tools: T[],
+  platform: string,
+): T[] {
+  return tools.filter((tool) => {
+    for (const [plat, names] of Object.entries(PLATFORM_ONLY_TOOLS)) {
+      if (names.has(tool.name) && platform !== plat) return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * A tool definition the API will accept: an `input_schema` object with a
+ * string `type`. A capture can carry less — the 2026-09-18T01:26Z rebake on
+ * CC v2.1.275 recorded `advisor` as `{"name":"advisor","description":"",
+ * "input_schema":{}}`, a remote-config tool caught half-loaded — and Fable
+ * refuses any request advertising it (`tools.0.custom.input_schema.type: Field
+ * required`, dario#1376) while other families let it through. The name stays
+ * KNOWN (CC_NATIVE_NAMES_UNION, identity mapping, the config-scoped
+ * preservation); the definition is never put on the wire.
+ */
+export function isAdvertisableToolDefinition(def: unknown): boolean {
+  if (!def || typeof def !== 'object') return false;
+  const schema = (def as { input_schema?: unknown }).input_schema;
+  return !!schema && typeof schema === 'object' && typeof (schema as { type?: unknown }).type === 'string';
+}
+
+/** Names in the bundle whose definition is not advertisable (see above). Empty on a clean bake. */
+export const CC_TOOL_DEFINITIONS_UNADVERTISABLE: Set<string> = new Set(
+  (TEMPLATE.tools as Array<{ name: string }>).filter((t) => !isAdvertisableToolDefinition(t)).map((t) => String(t.name)),
+);
+
+/** CC's exact tool definitions for the current platform — filtered from the bundled union. */
+export const CC_TOOL_DEFINITIONS = filterToolsForPlatform(
+  (TEMPLATE.tools as Array<{ name: string }>).filter(isAdvertisableToolDefinition),
+  process.platform,
+);
+
+/** The UNFILTERED bundled union — every tool the bake knows across platforms
+ *  (PLATFORM_ONLY_TOOLS keeps the bundle a superset). The identity-mapping,
+ *  detection, and advertise paths intersect with what the CLIENT declared,
+ *  and the client's declaration already encodes its platform — a Linux CC
+ *  never declares PowerShell. Filtering those paths by the PROXY HOST's
+ *  process.platform (pre-v4.8.136) made a Linux-hosted dario treat a win32
+ *  client's PowerShell/Glob/Grep as non-native: PowerShell fell to the
+ *  unmapped round-robin, and all three were dropped from the advertised
+ *  array (Glob/Grep translated via lowercase aliases but were never sent
+ *  upstream). Host-filtered CC_TOOL_DEFINITIONS stays correct for the paths
+ *  with no client declaration to mirror: the full-template fallback, the
+ *  merge-mode base array, and Fable's no-tools shape. */
+export const CC_TOOL_DEFINITIONS_UNION = (TEMPLATE.tools as Array<{ name: string }>).filter(isAdvertisableToolDefinition);
+/**
+ * The most the template can add to an outbound prompt, in bytes: the largest
+ * system prompt the bundle carries plus every advertisable tool definition.
+ * The key-budget reservation (keys.ts requestBudgetReservation) adds this to
+ * the client's own body so a request is bounded by what dario SENDS, not by
+ * what the client sent — the template's prompt is billed to the key too.
+ */
+export const CC_TEMPLATE_PROMPT_BYTES: number = (() => {
+  const t = TEMPLATE as { system_prompt?: unknown; system_prompt_variants?: Record<string, unknown> };
+  const sizes = [JSON.stringify(t.system_prompt ?? '').length, ...Object.values(t.system_prompt_variants ?? {}).map((v) => JSON.stringify(v ?? '').length)];
+  return Math.max(0, ...sizes) + JSON.stringify(CC_TOOL_DEFINITIONS_UNION).length;
+})();
+
+/** Every name the bundle knows — including one whose definition is not advertisable (dario#1376). */
+export const CC_NATIVE_NAMES_UNION: Set<string> = new Set(
+  (TEMPLATE.tools as Array<{ name: string }>).map((t) => String(t.name)),
+);
+
+/** Lowercased names of the advertisable non-MCP CC tools: the set buildCCRequest
+ *  matches a client declaration against, case-insensitively, when it advertises. */
+const CC_TOOL_NAMES_LOWER: Set<string> = new Set(
+  CC_TOOL_DEFINITIONS_UNION.filter((t) => !isMcpToolName(t.name)).map((t) => t.name.toLowerCase()),
+);
+
+/** CC's own tool names, EXACT case ("Read", "Bash", "Agent", …). A CC client's
+ *  tools identity-map to themselves and OVERRIDE TOOL_MAP — whose lowercase
+ *  cross-client aliases ('read' → {path}/{filePath}) would otherwise mistranslate
+ *  a CC tool (Read's file_path → path). Exact case is the discriminator: CC sends
+ *  PascalCase, the {path}-style clients send lowercase/snake, so a non-CC `read`
+ *  still routes through TOOL_MAP. Tracks the live bundle (refreshed each bake).
+ *  HOST-filtered — the routing, detection, and advertise paths use the
+ *  _UNION variants below so a client on a different platform than the proxy
+ *  host still identity-maps (v4.8.136). */
+export const CC_NATIVE_NAMES: Set<string> = new Set(
+  CC_TOOL_DEFINITIONS.map((t) => String((t as { name: string }).name)),
+);
+
+/** MCP tools attached to a CC session are namespaced `mcp__<server>__<tool>`.
+ *  Real CC advertises them VERBATIM after its built-ins — the schemas are
+ *  operator-supplied, so there is no canonical template entry to substitute.
+ *  Passing them through unchanged IS CC's wire shape; remapping them was the
+ *  divergence. Before v4.8.135 they fell through to the unmapped-tool
+ *  round-robin: dropped from the advertised array (the model never saw them)
+ *  while history tool_use blocks were renamed onto Bash/Read/… with junk args
+ *  — seen live as "tool substitution: 28/52 client tools not in TOOL_MAP" on
+ *  a CC session with an MCP server attached. Like CC_NATIVE_NAMES, these
+ *  identity-map and skip TOOL_MAP entirely. */
+export function isMcpToolName(name: unknown): boolean {
+  return typeof name === 'string' && name.startsWith('mcp__');
+}
+
+/** Server segment of the MCP-shaped name a client tool outside Claude Code's
+ *  set is carried under on a Claude Code-shaped request: `submit_review` goes
+ *  out as `mcp__client__submit_review`. Every tool real Claude Code sends
+ *  beyond its built-ins is named `mcp__<server>__<tool>`, so a bare foreign
+ *  name next to Claude Code's tools is a shape it never produces. */
+export const CLIENT_TOOL_MCP_PREFIX = 'mcp__client__';
+
+/** Anthropic's limit on a tool name. The MCP-shaped name has to fit it. */
+const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+
+/**
+ * A client tool that cannot go out on a Claude Code-shaped request: not a
+ * custom tool with an input_schema (an Anthropic-defined tool such as
+ * `computer_20251124` keeps its fixed name and cannot be renamed), or a name
+ * that does not fit Anthropic's tool-name limit once MCP-shaped. The proxy
+ * answers 400 naming each tool; dropping one would leave the model unable to
+ * call a tool the client declared.
+ */
+export class UnsupportedClientToolError extends Error {
+  readonly tools: ReadonlyArray<{ name: string; reason: string }>;
+  constructor(tools: Array<{ name: string; reason: string }>) {
+    super(
+      `dario cannot carry ${tools.length === 1 ? 'this client tool' : 'these client tools'} on a Claude Code-shaped request: `
+      + tools.map((t) => `"${t.name}" (${t.reason})`).join('; ')
+      + '. Declare each as a custom tool with an input_schema and a name of at most '
+      + `${64 - CLIENT_TOOL_MCP_PREFIX.length} characters, or run dario with --preserve-tools to forward your tools verbatim.`,
+    );
+    this.name = 'UnsupportedClientToolError';
+    this.tools = tools;
+  }
+}
+
+const PASTE_ONLY_RULE_START = 'When a message is nothing but pasted text';
+const PASTE_ONLY_RULE_END = 'not a request from the user.';
+
+/**
+ * Removes the paste-only sentence from the `<pasted_content>` rule, so
+ * instructions inside pasted content are followed only where the user's own
+ * message asks. The sentence is found by its start and end markers; a prompt
+ * missing either is returned unchanged, so a second pass is a no-op. Applied to
+ * the exported prompts, never to the bundle, which stays as captured.
+ */
+export function withoutPasteOnlyExemption(prompt: string): string {
+  const start = prompt.indexOf(PASTE_ONLY_RULE_START);
+  if (start === -1) return prompt;
+  const end = prompt.indexOf(PASTE_ONLY_RULE_END, start);
+  if (end === -1) return prompt;
+  const from = prompt[start - 1] === ' ' ? start - 1 : start;
+  return prompt.slice(0, from) + prompt.slice(end + PASTE_ONLY_RULE_END.length);
+}
+
+/** CC's static system prompt (~25KB). The shared base — baked from a non-Fable
+ *  model (Opus). CC ships some models a larger, model-specific prompt; see
+ *  CC_SYSTEM_PROMPT_FABLE / systemPromptForModel. */
+export const CC_SYSTEM_PROMPT = withoutPasteOnlyExemption(TEMPLATE.system_prompt);
+
+/**
+ * Fable-family system-prompt variant. CC 2.1.198 sends Fable a materially larger,
+ * model-specific prompt than the shared base (extra "# Communicating with the
+ * user"/autonomy sections + the Fable identity block). Baked separately so Fable
+ * requests carry Fable's actual CC prompt instead of the Opus base. Falls back to
+ * the base when the variant isn't present in the template (older bundles).
+ */
+const _variants: Record<string, string> = Object.fromEntries(
+  Object.entries(promptVariantsOf(TEMPLATE)).map(([k, v]) => [k, withoutPasteOnlyExemption(v)]),
+);
+export const CC_SYSTEM_PROMPT_FABLE: string = _variants.fable ?? CC_SYSTEM_PROMPT;
+
+/**
+ * Opus 5 variant. CC 2.1.220 ships opus-5 a prompt ~50% larger than the
+ * opus-4-8 base, naming itself ("You are powered by the model named Opus 5")
+ * and adding `# Delivering work` / `# Corrections` sections. Falls back to the
+ * base when the bundle carries no variant.
+ */
+export const CC_SYSTEM_PROMPT_OPUS5: string = _variants['opus-5'] ?? CC_SYSTEM_PROMPT;
+
+/**
+ * Sonnet 5 variant — the largest divergence of the four: CC sends it the
+ * long-form prompt (~28K chars vs the base's ~6.6K raw), a different prompt
+ * family rather than the base plus a few sections.
+ */
+export const CC_SYSTEM_PROMPT_SONNET5: string = _variants['sonnet-5'] ?? CC_SYSTEM_PROMPT;
+
+/**
+ * The system prompt CC would send for `model`: a family in VARIANT_FAMILIES
+ * gets its captured variant, every other model gets the shared base. Keeps
+ * dario byte-aligned with CC's per-model system prompt (dario#lock-step).
+ *
+ * Selection iterates VARIANT_FAMILIES (live-fingerprint.ts) — the same table
+ * the bake captures from — so the two sides cannot drift apart. A family
+ * whose variant is absent from the loaded template falls back to the base;
+ * `dario doctor`'s "Prompt variants" row surfaces that state instead of
+ * letting it pass silently.
+ */
+export function systemPromptForModel(model?: string): string {
+  const m = (model ?? '').toLowerCase();
+  for (const f of VARIANT_FAMILIES) {
+    if (f.matches(m)) return _variants[f.key] ?? CC_SYSTEM_PROMPT;
+  }
+  return CC_SYSTEM_PROMPT;
+}
+
+/** CC's agent identity string. */
+export const CC_AGENT_IDENTITY = TEMPLATE.agent_identity;
+
+/**
+ * Resolve the system prompt for outbound CC-shaped requests.
+ *
+ * Empirically validated against Anthropic's billing classifier in
+ * docs/research/system-prompt-classifier-study.md (and reproducible from
+ * scripts/research/test-system-prompt-mods.mjs + scripts/research/test-constraint-removal.mjs):
+ * system prompt content, length, and block count are not classifier
+ * inputs — every variant tested routed to `five_hour` (subscription).
+ *
+ * Modes:
+ *   - undefined / 'verbatim' — CC's prompt unchanged (default; existing
+ *     setups don't regress).
+ *   - 'partial' — strip purely behavioral constraints, leaving every
+ *     refusal reminder and tool description intact. On the compact CC
+ *     prompt (2.1.x+) the lone behavioral constraint is the comment-
+ *     density / match-surrounding-style line, swapped for a positive
+ *     "be thorough" instruction; on older verbose prompts the
+ *     Tone-and-style + Text-output sections and the Doing-tasks bullets
+ *     are removed as well. Recovers the output capability the
+ *     constraint-removal research test measured.
+ *   - 'aggressive' — partial + remove the prompt-level RLHF reminder (the
+ *     IMPORTANT: line re-stating refusal categories) and the caution
+ *     guidance about hard-to-reverse / outward-facing actions (the
+ *     "Executing actions with care" section on older prompts). Adds
+ *     little practical difference vs partial — alignment is RLHF-trained,
+ *     not prompt-trained, so refusals survive prompt removal.
+ *   - any other string — used as the literal system prompt text. The
+ *     CLI resolves file paths to file contents up-front so this layer
+ *     stays filesystem-pure.
+ */
+/**
+ * Precedence framing inserted between CC's persona prompt and the client's
+ * own system text in the merged block-3 system prompt.
+ *
+ * Why this exists (observed 2026-06-12, deepdive planner regression): a bare
+ * `\n\n` append silently stopped working on claude-sonnet-4-6 — the model
+ * followed the CC persona and treated the appended client instructions as
+ * ignorable boilerplate, deterministically (0/6 on a trivial "reply with
+ * only PONG" system instruction; haiku obeyed 6/6 on the identical merged
+ * body, and the same shape had obeyed on sonnet the previous evening — an
+ * upstream serving-side behavior shift, not a dario regression). With this
+ * explicit override framing, sonnet obedience returned to 6/6.
+ *
+ * Billing-safety: system prompt CONTENT/length are not classifier inputs —
+ * docs/research/system-prompt-classifier-study.md — so this framing cannot
+ * affect Max-pool routing.
+ */
+export const CLIENT_SYSTEM_PREFACE =
+  '\n\n---\n\nIMPORTANT: The operator of this session has supplied the following ' +
+  'task-specific instructions. For this conversation they OVERRIDE any ' +
+  'conflicting general behavior described above. Follow them exactly:\n\n';
+
+// Memoize the stripped prompt by (base, level) (#642-audit): resolveSystemPrompt
+// runs per request and stripBehavioralConstraints does ~12 regex passes over the
+// ~25KB prompt. Keyed on the base STRING so a runtime template re-capture (a new
+// base) correctly misses and re-strips. Bounded to a few bases; cleared if it
+// somehow grows past a small cap.
+const _stripCache = new Map<string, Map<string, string>>();
+function stripBehavioralConstraintsMemo(base: string, level: 'partial' | 'aggressive'): string {
+  if (_stripCache.size > 8) _stripCache.clear();
+  let byLevel = _stripCache.get(base);
+  if (!byLevel) { byLevel = new Map(); _stripCache.set(base, byLevel); }
+  let v = byLevel.get(level);
+  if (v === undefined) { v = stripBehavioralConstraints(base, level); byLevel.set(level, v); }
+  return v;
+}
+
+export function resolveSystemPrompt(arg: string | undefined, model?: string): string {
+  const base = systemPromptForModel(model);
+  if (!arg || arg === 'verbatim') return base;
+  if (arg === 'partial') return stripBehavioralConstraintsMemo(base, 'partial');
+  if (arg === 'aggressive') return stripBehavioralConstraintsMemo(base, 'aggressive');
+  return arg;
+}
+
+/**
+ * Port of scripts/research/test-constraint-removal.mjs:stripConstraints. Pure over
+ * its input; returns the input unchanged if no target matches (so a CC
+ * bump that renames sections degrades to verbatim rather than producing
+ * an unpredictable strip). Handles both the verbose pre-2.1 prompt
+ * (`# Tone and style` etc.) and the compact 2.1.x+ prompt; the patterns
+ * for the era not in play are simply no-ops.
+ */
+function stripBehavioralConstraints(input: string, level: 'partial' | 'aggressive'): string {
+  let s = input;
+
+  // ── Legacy (pre-2.1 verbose prompt): no-ops on the compact prompt ──
+  s = s.replace(/# Tone and style[\s\S]*?(?=\n# |\n$|$)/m, '');
+  s = s.replace(/# Text output[^\n]*\n[\s\S]*?(?=\n# |\n$|$)/m, '');
+
+  const doingTasksConstraints: RegExp[] = [
+    /^ - Don't add features, refactor, or introduce abstractions[^\n]*\n[^\n]*\n[^\n]*\n[^\n]*\n[^\n]*\n/m,
+    /^ - Don't add error handling, fallbacks, or validation[^\n]*\n[^\n]*\n/m,
+    /^ - Default to writing no comments\.[^\n]*\n[^\n]*\n[^\n]*\n[^\n]*\n/m,
+    /^ - Don't explain WHAT the code does[^\n]*\n[^\n]*\n/m,
+    /^ - For exploratory questions[^\n]*\n[^\n]*\n/m,
+    /^ - Avoid backwards-compatibility hacks[^\n]*\n[^\n]*\n/m,
+  ];
+  for (const re of doingTasksConstraints) {
+    s = s.replace(re, '');
+  }
+
+  s = s.replace(
+    /^# Doing tasks\n/m,
+    '# Doing tasks\n\nBe thorough. Show your reasoning. Provide the context and explanations the user is likely to find useful. Use as many tokens as the task warrants.\n\n',
+  );
+
+  // ── Compact prompt (2.1.x+): its one behavioral constraint is the
+  // comment-density / match-surrounding-style line. Swap it for the same
+  // positive instruction the legacy Doing-tasks rewrite inserts. ──
+  s = s.replace(
+    /^Write code that reads like the surrounding code:[^\n]*\n/m,
+    'Be thorough. Show your reasoning. Provide the context and explanations the user is likely to find useful. Use as many tokens as the task warrants.\n',
+  );
+
+  if (level === 'aggressive') {
+    s = s.replace(/^IMPORTANT: Assist with authorized security testing[^\n]*\n/m, '');
+    s = s.replace(/^IMPORTANT: You must NEVER generate or guess URLs[^\n]*\n/m, '');
+    s = s.replace(/# Executing actions with care[\s\S]*?(?=\n# |\n$|$)/m, '');
+    // Compact prompt: the caution guidance is a single unheaded paragraph.
+    s = s.replace(/^For actions that are hard to reverse or outward-facing,[^\n]*\n/m, '');
+  }
+
+  return s;
+}
+
+/**
+ * Header-value keys from a captured template that must NEVER be replayed onto an
+ * outbound request, even though they are stored in `header_values`.
+ *
+ * - `x-api-key` is a capture artifact: the fingerprint spawn sets
+ *   ANTHROPIC_API_KEY=sk-dario-fingerprint-capture, and replaying that
+ *   placeholder alongside a real OAuth Bearer 401s on some tiers (dario#42).
+ * - `x-stainless-os` / `x-stainless-arch` describe the machine that ran the
+ *   CAPTURE, not CC's wire shape. The proxy already computes both correctly for
+ *   the current process; overlaying the captured values made a Linux host
+ *   announce `x-stainless-os: Windows` off a Windows-baked bundle (dario#854).
+ *
+ * `extractStaticHeaderValues` (live-fingerprint.ts) also refuses to STORE these,
+ * so new captures are clean. This skip list is what makes every ALREADY-baked
+ * template and warm cache self-heal without waiting for a re-bake.
+ */
+/**
+ * Headers a genuine Claude Code client sends to identify itself, which the
+ * passthrough path forwards verbatim instead of substituting template values.
+ *
+ * The template exists to SYNTHESISE CC's shape for clients that are not CC. On
+ * the passthrough path `isGenuineCCClient` has already established that the
+ * caller really is Claude Code, so its own headers are the authentic article and
+ * a capture is at best a good imitation of them. Measured before this changed:
+ * of 13 CC-identity headers a real client sent, 12 were replaced with template
+ * values and 1 was dropped — 0 forwarded (dario#885).
+ *
+ * Deliberately NOT in this list, because dario must own them:
+ *
+ *   authorization / x-api-key   must become the pool account's credential
+ *   x-claude-code-session-id    session rotation is a feature, not an accident
+ *   anthropic-beta              merged with operator pins + the per-account
+ *                               rejection cache; the client's set is not final
+ *   anthropic-version           already read from the client at the call site
+ *   accept / content-type       body framing, owned by the proxy
+ *   host / connection /         transport, owned by the HTTP stack; forwarding
+ *   content-length /            them corrupts the request
+ *   transfer-encoding /
+ *   accept-encoding / keep-alive
+ *
+ * Anything a future CC adds under the `x-stainless-*` or `x-claude-code-*`
+ * prefixes is forwarded by the prefix rules in
+ * `forwardClientCCIdentityHeaders` rather than needing to be enumerated here —
+ * the capture cannot see first-party-conditional headers at all (dario#885), so
+ * an allowlist of exact names would silently miss them.
+ */
+const CC_IDENTITY_HEADERS_TO_FORWARD = new Set<string>([
+  'user-agent',
+  'x-app',
+  'anthropic-dangerous-direct-browser-access',
+]);
+
+/** Prefixes whose every member is CC self-identification, forwarded wholesale. */
+const CC_IDENTITY_HEADER_PREFIXES = ['x-stainless-', 'x-claude-code-', 'x-client-'] as const;
+
+/** Never forwarded from the client even when it matches a prefix above. */
+const NEVER_FORWARD_FROM_CLIENT = new Set<string>([
+  'x-claude-code-session-id',   // dario rotates sessions deliberately
+]);
+
+/**
+ * Pick the CC-identity headers out of an inbound request so the passthrough
+ * path can forward them unchanged.
+ *
+ * Pure and exported so the allow/deny behaviour is unit-testable without
+ * standing up the proxy, matching `orderHeadersForOutbound` and
+ * `overlayTemplateHeaderValues`. Array-valued headers (Node allows repeats)
+ * take the first value; empty strings are skipped so a client sending a blank
+ * header cannot blank out a value dario would otherwise supply.
+ */
+export function forwardClientCCIdentityHeaders(
+  reqHeaders: Record<string, string | string[] | undefined>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [rawName, rawValue] of Object.entries(reqHeaders)) {
+    const name = rawName.toLowerCase();
+    if (NEVER_FORWARD_FROM_CLIENT.has(name)) continue;
+    const allowed = CC_IDENTITY_HEADERS_TO_FORWARD.has(name)
+      || CC_IDENTITY_HEADER_PREFIXES.some((p) => name.startsWith(p));
+    if (!allowed) continue;
+    const value = Array.isArray(rawValue) ? rawValue[0] : rawValue;
+    if (typeof value !== 'string' || value.length === 0) continue;
+    out[name] = value;
+  }
+  return out;
+}
+
+const NEVER_REPLAY_HEADER_VALUES = new Set<string>([
+  'x-api-key',
+  'x-stainless-os',
+  'x-stainless-arch',
+]);
+
+/**
+ * Overlay a captured template's `header_values` onto the outbound header record,
+ * skipping the keys that must never be replayed.
+ *
+ * Extracted as a pure function (like `orderHeadersForOutbound`) so the skip
+ * behaviour is unit-testable without spinning up the proxy. Mutates and returns
+ * `headers` for call-site convenience.
+ */
+export function overlayTemplateHeaderValues(
+  headers: Record<string, string>,
+  headerValues: Record<string, string> | undefined,
+): Record<string, string> {
+  if (!headerValues) return headers;
+  for (const [k, v] of Object.entries(headerValues)) {
+    if (NEVER_REPLAY_HEADER_VALUES.has(k.toLowerCase())) continue;
+    headers[k] = v;
+  }
+  return headers;
+}
+
+/**
+ * Apply the live template's captured header_order to an outbound header
+ * record. Returns a HeadersInit in one of two forms:
+ *
+ * - If the template has no header_order (bundled-only install, or capture
+ *   didn't record rawHeaders), returns the input record unchanged.
+ * - If header_order is present, returns an array of [name, value] pairs
+ *   in the captured order. `fetch()` serializes pairs to the wire in
+ *   array order; a plain Record or Headers instance doesn't preserve
+ *   order in the same way (Headers iteration is spec-sorted alphabetically,
+ *   and while modern V8 iterates own-property keys in insertion order,
+ *   nothing in the fetch contract guarantees that order reaches the HTTP
+ *   layer untouched — the array form is the one variant where wire order
+ *   is part of the spec).
+ *
+ * Caller-supplied headers that don't appear in the captured order are
+ * appended at the tail in their original insertion order so host-set
+ * headers (content-type, content-length) aren't silently dropped. Names
+ * in the captured order are emitted in the template's exact case; names
+ * only in the caller's map keep the caller's case.
+ *
+ *
+ * @param headers outbound headers the proxy built
+ * @param overrideHeaderOrder test-only override; production callers pass nothing
+ */
+export function orderHeadersForOutbound(
+  headers: Record<string, string>,
+  overrideHeaderOrder?: string[] | undefined,
+): Record<string, string> | Array<[string, string]> {
+  const order = overrideHeaderOrder !== undefined ? overrideHeaderOrder : TEMPLATE.header_order;
+  if (!Array.isArray(order) || order.length === 0) {
+    return headers;
+  }
+  const lowerToValue = new Map<string, string>();
+  const lowerToOriginalKey = new Map<string, string>();
+  for (const [k, v] of Object.entries(headers)) {
+    const lk = k.toLowerCase();
+    lowerToValue.set(lk, v);
+    lowerToOriginalKey.set(lk, k);
+  }
+  const ordered: Array<[string, string]> = [];
+  const seen = new Set<string>();
+  for (const name of order) {
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    const value = lowerToValue.get(key);
+    if (value !== undefined) {
+      ordered.push([name, value]);
+      seen.add(key);
+    }
+  }
+  for (const [k, v] of Object.entries(headers)) {
+    const lk = k.toLowerCase();
+    if (!seen.has(lk)) {
+      ordered.push([k, v]);
+    }
+  }
+  return ordered;
+}
+
+/**
+ * Reorder a top-level JSON request body's keys to match the captured CC
+ * wire order. JSON is unordered as a type but the serialization IS ordered
+ * — two requests with the same fields but different key order produce
+ * different bytes on the wire and are trivial to fingerprint.
+ *
+ * Unlike headers, JSON object keys are case-sensitive and V8 preserves
+ * insertion order for string keys (ES2015+), so a plain Record is
+ * sufficient — `JSON.stringify` walks it in insertion order.
+ *
+ * Contract:
+ * - If the template has no body_field_order or the override is empty,
+ *   the input is returned reference-equal (passthrough for pre-v3.22
+ *   baked templates and for test hermeticity).
+ * - Captured-order names that are missing from the caller's body are
+ *   skipped — never emitted as `undefined`.
+ * - Duplicate names in the captured order are deduped; first occurrence
+ *   wins.
+ * - Caller-supplied keys not in the captured order are appended at the
+ *   tail in insertion order, so a future Anthropic-added field doesn't
+ *   get silently dropped by a stale capture.
+ *
+ * @param body outbound request body the builder produced
+ * @param overrideOrder test-only override; production callers pass nothing
+ */
+export function orderBodyForOutbound(
+  body: Record<string, unknown>,
+  overrideOrder?: string[] | undefined,
+): Record<string, unknown> {
+  const order = overrideOrder !== undefined ? overrideOrder : TEMPLATE.body_field_order;
+  if (!Array.isArray(order) || order.length === 0) {
+    return body;
+  }
+  const ordered: Record<string, unknown> = {};
+  const seen = new Set<string>();
+  for (const name of order) {
+    if (seen.has(name)) continue;
+    if (Object.prototype.hasOwnProperty.call(body, name)) {
+      ordered[name] = body[name];
+      seen.add(name);
+    }
+  }
+  for (const k of Object.keys(body)) {
+    if (!seen.has(k)) {
+      ordered[k] = body[k];
+    }
+  }
+  return ordered;
+}
+
+// Framework identifiers that would flag non-CC usage. Stripped from the system
+// prompt and from message content text blocks before the request goes upstream.
+const FRAMEWORK_PATTERNS: RegExp[] = [
+  // Compound/hyphenated patterns run first so their halves can't be eaten
+  // by the simpler word-level patterns below.
+  /\b(roo[- ]?cline|roo[- ]?code|big[- ]?agi|claude[- ]?bridge|amazon\s+q)\b/gi,
+  /\b(openclaw|hermes|aider|cursor|windsurf|cline|continue|copilot|cody)\b/gi,
+  /\b(zed|plandex|tabby|opencode|daytona)\b/gi,
+  /\b(librechat|typingmind)\b/gi,
+  /\b(openai|gpt-4|gpt-3\.5)\b/gi,
+  /powered by [a-z]+/gi,
+  /\bgateway\b/gi,
+  // OC's sessions_* tool-name prefix — flagged as a fingerprint in dario#23.
+  /\bsessions_[a-z_]+\b/gi,
+];
+
+// Patterns SAFE to apply to message *content* (user data: source code, docs,
+// tool output). This is the small subset of FRAMEWORK_PATTERNS that consists
+// only of distinctive, multi-word / unambiguous product identifiers which
+// effectively never appear verbatim in real code or prose. It deliberately
+// EXCLUDES every bare single-word pattern (`continue`, `cursor`, `gateway`,
+// `openai`, `hermes`, `zed`, `tabby`, `cody`, `aider`, `cline`, `copilot`,
+// `windsurf`, …) because those collide with ordinary code tokens and English.
+// Stripping those from a user's payload silently CORRUPTS it: the JS keyword
+// `continue;` became `;` (because Continue.dev is on the list), which made a
+// code auditor report a bare-semicolon "no-op" that THIS PROXY had introduced.
+// A proxy must never mutate the user's content — identity-masking of the
+// *client's framing* is the job of the system-prompt scrub, which still uses
+// the full FRAMEWORK_PATTERNS set.
+const CONTENT_FRAMEWORK_PATTERNS: RegExp[] = [
+  /\b(roo[- ]?cline|roo[- ]?code|big[- ]?agi|claude[- ]?bridge)\b/gi,
+  /\b(librechat|typingmind)\b/gi,
+  // NOTE: deliberately omits `/powered by [a-z]+/` and `/\bgateway\b/` etc.
+  // from FRAMEWORK_PATTERNS — those would strip legitimate user content like
+  // a "Powered by Stripe" footer or a `gateway` variable. Only distinctive,
+  // multi-token product names that never occur verbatim in real code/data are
+  // safe to mask in the user's payload.
+];
+
+function scrubWithPatterns(text: string, patterns: readonly RegExp[]): string {
+  let result = text;
+  for (const pattern of patterns) {
+    pattern.lastIndex = 0;
+    result = result.replace(pattern, (match, ...args) => {
+      const offset = args[args.length - 2] as number;
+      const src = args[args.length - 1] as string;
+      const before = offset > 0 ? src[offset - 1] : '';
+      const after = offset + match.length < src.length ? src[offset + match.length] : '';
+      // Preserve matches embedded in filesystem paths or URLs. `\b` word
+      // boundaries fire between `.` / `/` and word chars, which made
+      // `/Users/foo/.openclaw/workspace/` collapse to `/Users/foo/./workspace/`
+      // (dario#35). A preceding `.`, `/`, `\`, `-`, or `_` or a following
+      // `/` or `\` is a strong signal the identifier is part of a path or
+      // slug, not prose — leave it alone.
+      if (before === '.' || before === '/' || before === '\\' || before === '-' || before === '_') return match;
+      if (after === '/' || after === '\\') return match;
+      return '';
+    });
+  }
+  return result;
+}
+
+// Scrub the CLIENT'S system prompt / identity fields — full pattern set.
+export function scrubFrameworkIdentifiers(text: string): string {
+  return scrubWithPatterns(text, FRAMEWORK_PATTERNS);
+}
+
+// Scrub message CONTENT (the user's code/data) — content-safe subset only, so
+// a user's payload is never corrupted. See CONTENT_FRAMEWORK_PATTERNS.
+export function scrubFrameworkIdentifiersInContent(text: string): string {
+  return scrubWithPatterns(text, CONTENT_FRAMEWORK_PATTERNS);
+}
+
+/**
+ * Detect text-tool-protocol clients (Cline, Kilo Code, Roo Code and
+ * their forks) by fingerprinting the incoming system prompt.
+ *
+ * These clients ship their own XML-style tool invocation protocol in
+ * the system prompt (`<execute_command>`, `<replace_in_file>`,
+ * `<attempt_completion>`, …) and parse the model's output with a
+ * regex tuned to that exact shape. When dario's default mode
+ * substitutes CC's canonical tools into the `tools` array, the model
+ * correctly emits Anthropic's generic `<function_calls><invoke>`
+ * wrapper — which is well-formed for a CC-tool request but
+ * unparseable for a text-protocol client, so every edit surfaces as
+ * an error in the client UI even though the model produced a valid
+ * response (dario#40, reported by @ringge).
+ *
+ * The fix is preserve-tools behavior: skip the CC tool swap so the
+ * model sees the client's own schema and emits its native XML shape.
+ * Auto-detection saves users from having to discover the
+ * `--preserve-tools` flag exists; the flag is still honored as an
+ * explicit override and `--hybrid-tools` outranks detection.
+ *
+ * Detection must run BEFORE `scrubFrameworkIdentifiers` so brand
+ * names like "Cline" / "Roo" are still present. Tool-protocol
+ * markers are scrub-proof on their own.
+ *
+ * Returns the matched family (`cline` / `kilo` / `roo` / `cline-like` /
+ * `hermes`) or null when no signature is present.
+ *
+ * Hermes Agent (Nous Research) is a different case from the Cline family —
+ * it uses the standard Anthropic JSON tool-use protocol (not XML). But it
+ * ships ~40 tools, 15+ of which have no CC equivalent (browser_*, vision_*,
+ * image_generate, text_to_speech, skills_*, memory, session_search,
+ * cronjob, send_message, ha_*, mixture_of_agents, delegate_task, …). In
+ * default mode dario distributes unmapped tools onto random CC slots which
+ * silently misroutes them. preserve-tools is the correct default for
+ * Hermes for the same outcome as Cline (client's tool schema passes
+ * through untouched) even though the reason is different. The function
+ * conflates both cases because the downstream dispatch is identical.
+ * Reported via @vmvarg4 on X after the v3.30.5 marketing push.
+ */
+export function detectTextToolClient(systemText: string): string | null {
+  if (!systemText) return null;
+  if (/\bYou are Cline\b/.test(systemText)) return 'cline';
+  if (/\bYou are Kilo Code\b/.test(systemText)) return 'kilo';
+  if (/\bYou are Roo\b/.test(systemText)) return 'roo';
+  // Hermes Agent (Nous Research) — canonical opener from agent/prompt_builder.py.
+  // Also accept "created by Nous Research" as a secondary anchor since
+  // downstream forks may edit the leading identity line but tend to keep
+  // attribution intact.
+  if (/\bYou are Hermes Agent\b/.test(systemText)) return 'hermes';
+  if (/\bcreated by Nous Research\b/.test(systemText)) return 'hermes';
+  // arnie (askalf) — IT-troubleshooting CLI built on the Anthropic SDK.
+  // Identity line is stable across versions ("You are Arnie, a portable
+  // IT tech troubleshooting assistant ..."). Tool *names* (shell, read_file,
+  // grep, ...) overlap with TOOL_MAP so structural fallback won't catch it,
+  // but the *schemas* diverge from CC's (arnie's shell takes {cmd, timeout_s,
+  // working_directory}; CC's Bash takes {command, description}) so default
+  // round-robin remap silently corrupts the calls. Identity match → auto
+  // preserve-tools is the only correct routing.
+  if (/\bYou are Arnie\b/.test(systemText)) return 'arnie';
+  // hands (askalf) — cross-platform computer-use agent built on the
+  // Anthropic SDK with computer-use beta tools (computer_20251124,
+  // bash_20250124, text_editor_20250728). Identity line is stable
+  // across CLI mode ("You are a computer control agent with FULL
+  // access to this <os> machine ...") and SDK mode ("You are a
+  // computer control agent on <os> ..."). Tool name `bash` overlaps
+  // with TOOL_MAP, but the wire shape is Anthropic's beta computer-
+  // use tool (`type: 'bash_20250124'`, no `command`/`description`
+  // schema) — default round-robin remap would corrupt those calls
+  // and lose the `computer` / `text_editor` tools entirely (neither
+  // is in TOOL_MAP, structural fallback won't catch them at the
+  // 80% threshold either). Identity match → auto preserve-tools,
+  // like arnie.
+  if (/\bYou are a computer control agent\b/.test(systemText)) return 'hands';
+  // Protocol-signature fallback — unique to the Cline family and its
+  // forks; survives a forked system prompt that edited the identity
+  // string out but kept the tool protocol intact.
+  if (/<attempt_completion>/.test(systemText)) return 'cline-like';
+  if (/<ask_followup_question>/.test(systemText)) return 'cline-like';
+  if (/<<<<<<< SEARCH\b/.test(systemText)) return 'cline-like';
+  return null;
+}
+
+/**
+ * Structural fallback for non-CC clients that the identity-string
+ * detector doesn't recognize. When the operator hands us 3+ tools and
+ * ≥80% of them appear in neither TOOL_MAP nor CC_NATIVE_NAMES, we're
+ * looking at a custom client whose tool surface has effectively no
+ * overlap with CC's.
+ * Default-mode round-robin onto CC fallback slots silently corrupts
+ * those calls (the client gets back a Glob/Read/Bash response shape
+ * its own tool can't parse).
+ *
+ * Returns 'unknown-non-cc' for that case so buildCCRequest can flip
+ * to preserve-tools — the only correct routing for a tool surface
+ * dario doesn't understand. Unlike the identity-string detector, this
+ * catches future clients we haven't added an explicit pattern for
+ * (in-house agents, OpenClaw derivatives, etc.) without needing
+ * per-client maintenance.
+ *
+ * Threshold reasoning:
+ * - 100% foreign (ANY size, including 1-2 tools): unambiguously non-CC. A real
+ *   CC client always carries Bash + Read (TOOL_MAP keys once lowercased) or its
+ *   own native tools (CC_NATIVE_NAMES), so it can never present a fully-foreign
+ *   surface; only a genuinely non-CC tool set can. This catches the small
+ *   in-house clients the 3-tool rule below
+ *   misses, e.g. forge inspection agents dispatched with just their capability
+ *   floor ([memory_store, db_query]). Before this, those 2-tool surfaces fell
+ *   under a len<3 guard and got round-robined onto CC fallback slots, which
+ *   silently corrupts every call (the model upstream never sees the real tool).
+ * - A foreign tool, no CC-native name, and an alias that shares a CC tool's
+ *   name (`grep`, `bash`): non-CC at any ratio. Claude Code declares its own
+ *   tools by their exact names, so such a surface is some other client's, and
+ *   its own schemas are what it parses; remap would put its aliases through
+ *   TOOL_MAP's argument translation. A surface that names no CC tool gets the
+ *   full template instead and stays in remap, fallback slots visible.
+ * - Mixed surface otherwise: require 3+ tools AND ≥80% unmapped. The 80% leaves
+ *   room for a non-CC client that legitimately reuses 1-2 of TOOL_MAP's
+ *   aliases; the 3-tool floor keeps a 1-2 tool partial CC load in remap.
+ */
+export function detectNonCCByTools(
+  clientTools: Array<Record<string, unknown>> | undefined,
+): string | null {
+  if (!clientTools || clientTools.length === 0) return null;
+  let unmapped = 0;
+  let native = false;
+  let sharesCCName = false;
+  for (const tool of clientTools) {
+    const rawName = (tool.name as string) || '';
+    // A tool is "foreign" only if dario can neither map it (TOOL_MAP, by
+    // lowercased cross-client alias) nor recognize it as CC's own (CC_NATIVE_NAMES,
+    // by exact PascalCase) nor pass it through as an MCP tool (mcp__* — identity,
+    // like CC natives). CC-native tools identity-map to themselves in the remap
+    // path (see buildCCRequest), so counting them here inflates the ratio and
+    // mis-flags a modern, agentic-heavy CC client (Agent, Skill, Workflow, Task*,
+    // … — in the live bundle but absent from TOOL_MAP's alias table) as
+    // 'unknown-non-cc', flipping it to preserve and discarding the CC tool
+    // fingerprint dario exists to present. Same trap for MCP tools: two or three
+    // attached servers push a real CC session past the 80% line on their own
+    // (28/52 seen live). Mirror the routing's membership test so detection and
+    // routing agree. An ALL-mcp surface now scores ratio 0 and stays in default
+    // mode — safe, because the advertise path sends an mcp-only declaration
+    // verbatim rather than falling back to the full CC template.
+    // Union set, not the host-filtered one: a win32 client's PowerShell is
+    // native regardless of the platform dario itself runs on (v4.8.136).
+    if (CC_NATIVE_NAMES_UNION.has(rawName)) { native = true; continue; }
+    if (CC_TOOL_NAMES_LOWER.has(rawName.toLowerCase())) sharesCCName = true;
+    if (!TOOL_MAP[rawName.toLowerCase()] && !isMcpToolName(rawName)) unmapped++;
+  }
+  const ratio = unmapped / clientTools.length;
+  // Fully-foreign surface → non-CC at any size. Real CC always has Bash+Read
+  // mapped or its own native tools, so ratio === 1 is unreachable for it; only a
+  // genuinely foreign client hits it.
+  if (ratio === 1) return 'unknown-non-cc';
+  // Claude Code declares its own tools by their exact names. A foreign tool
+  // next to an alias sharing a CC tool's name, with no exact-case CC name, is
+  // another client's surface: its tools go out as declared.
+  if (unmapped > 0 && !native && sharesCCName) return 'unknown-non-cc';
+  // Mixed surface: only flag once there are enough tools to be confident.
+  if (clientTools.length >= 3 && ratio >= 0.8) return 'unknown-non-cc';
+  return null;
+}
+
+/**
+ * Flatten an Anthropic-shaped `system` field (string or array of text
+ * blocks) to a single joined string. Skips the billing-tag block so
+ * captured billing metadata isn't conflated with the operator's own
+ * prompt. Used both by the main request-build path (post-scrub) and
+ * by the early text-tool-client detector (pre-scrub).
+ */
+export function extractSystemText(clientBody: Record<string, unknown>): string {
+  const sys = clientBody.system;
+  if (typeof sys === 'string') return sys;
+  if (Array.isArray(sys)) {
+    return (sys as Array<{ text?: string }>)
+      .filter(b => b.text && !b.text.includes('x-anthropic-billing-header:'))
+      .map(b => b.text)
+      .join('\n\n');
+  }
+  return '';
+}
+
+/**
+ * Client tool name → CC tool mapping with parameter translation.
+ *
+ * `translateArgs` runs forward (client → CC) when building the upstream
+ * request. `translateBack` runs reverse (CC → client) when rewriting
+ * the upstream response so the client receives tool_use input in the
+ * shape its own validator expects. The forward direction is lossy
+ * (multiple client field names may collapse to one CC field), so the
+ * reverse picks the *primary* client field name — the first one in
+ * the forward function's `||` chain. That's the field the client's
+ * own schema defines, which is the one its validator will accept.
+ *
+ * Issue #29 (boeingchoco) is the bug this layer fixes: prior to v3.7.0,
+ * dario rewrote the tool name on response (Bash → process) but left
+ * the input shape alone, so the client saw `{command: ...}` against a
+ * schema that wanted `{action: ...}` and rejected the call.
+ */
+export interface ToolMapping {
+  ccTool: string;
+  translateArgs?: (args: Record<string, unknown>) => Record<string, unknown>;
+  translateBack?: (args: Record<string, unknown>) => Record<string, unknown>;
+  /**
+   * Top-level field names the client's original tool schema declared.
+   * Populated only in hybrid mode (`hybridTools: true`) so the reverse
+   * path can inject request-context values (sessionId, requestId, …)
+   * into fields CC's schema doesn't carry. Unset in default mode.
+   */
+  clientFields?: string[];
+  /**
+   * Reverse-lookup priority for resolving collisions when multiple client
+   * tools map to the same CC tool. Higher wins. Default 10. Set lower for
+   * niche / lossy translations (e.g. OpenClaw's `process` action-discriminator
+   * tool loses most of its schema when flattened to Bash, so bash/exec
+   * should win the Bash reverse slot when both are declared — dario#37).
+   */
+  reverseScore?: number;
+}
+
+/**
+ * Request context extracted once per incoming request. Source for
+ * hybrid-mode field injection — fields declared on the client's tool
+ * but not on CC's get filled from here on the reverse path.
+ */
+export interface RequestContext {
+  sessionId: string;
+  requestId: string;
+  channelId?: string;
+  userId?: string;
+  timestamp: string; // ISO 8601
+}
+
+/**
+ * Map from client-declared field name (lowercase) to the RequestContext
+ * key that supplies its value. A field declared on the client's tool
+ * whose name matches one of these gets auto-filled in hybrid mode.
+ *
+ * Case-insensitive match on the client's declared field name. Both
+ * snake_case and camelCase variants map to the same source.
+ */
+const CONTEXT_FIELD_SOURCES: Record<string, keyof RequestContext> = {
+  sessionid: 'sessionId',
+  session_id: 'sessionId',
+  requestid: 'requestId',
+  request_id: 'requestId',
+  channelid: 'channelId',
+  channel_id: 'channelId',
+  userid: 'userId',
+  user_id: 'userId',
+  timestamp: 'timestamp',
+  createdat: 'timestamp',
+  created_at: 'timestamp',
+};
+
+/**
+ * Fill in fields declared on the client's tool schema that are still
+ * absent from the translated input, drawing values from the request
+ * context. Only runs when a mapping has `clientFields` populated
+ * (hybrid mode) and an input object is present. Fields already set
+ * by `translateBack` are never overwritten.
+ */
+function injectContextFields(
+  input: Record<string, unknown>,
+  clientFields: string[] | undefined,
+  ctx: RequestContext | undefined,
+): Record<string, unknown> {
+  if (!clientFields || !ctx) return input;
+  for (const field of clientFields) {
+    if (field in input && input[field] !== undefined && input[field] !== null && input[field] !== '') continue;
+    const sourceKey = CONTEXT_FIELD_SOURCES[field.toLowerCase()];
+    if (!sourceKey) continue;
+    const value = ctx[sourceKey];
+    if (value !== undefined) input[field] = value;
+  }
+  return input;
+}
+
+/**
+ * Default prompt injected into WebFetch calls when the client omits one.
+ * CC's WebFetch input_schema marks both {url, prompt} as required, but
+ * fetch-style client tools (Cline `browse`, Copilot `fetch_webpage` sans
+ * query, OpenClaw `fetch`, etc.) typically ship only a URL. Without a
+ * synthesized prompt the upstream request is rejected by schema
+ * validation before the model ever sees it (dario#43).
+ */
+const WEBFETCH_DEFAULT_PROMPT = 'Extract and return the main content of this page.';
+
+/**
+ * Build WebFetch args from a client URL + optional client-side prompt-like
+ * field. Clients that carry intent (Copilot's `query`, Hermes' `prompt`)
+ * pass it through; everyone else gets the generic extraction prompt.
+ */
+function webFetchArgs(url: unknown, clientPrompt?: unknown): Record<string, unknown> {
+  const prompt = typeof clientPrompt === 'string' && clientPrompt.trim() !== ''
+    ? clientPrompt
+    : WEBFETCH_DEFAULT_PROMPT;
+  return { url: String(url || ''), prompt };
+}
+
+const TOOL_MAP: Record<string, ToolMapping> = {
+  // Direct maps
+  // Note on translateBack field names: the vast majority of client bash-like
+  // tools use `command` (the Anthropic convention), not `cmd`. OpenClaw's
+  // `exec` tool takes `{command, workdir, env, ...}` (dario#36 triage).
+  // Hybrid mode overrides these with the actual client schema via clientFields,
+  // but default mode relies on these output names being the common case.
+  bash: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.cmd || a.command || a.c || '', ...(a.description ? { description: a.description } : {}) }),
+    translateBack: (a) => ({ command: a.command ?? '', ...(a.description ? { description: a.description } : { description: a.command ?? '' }) }),
+  },
+  exec: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.cmd || a.command || a.c || '', ...(a.description ? { description: a.description } : {}) }),
+    translateBack: (a) => ({ command: a.command ?? '', ...(a.description ? { description: a.description } : { description: a.command ?? '' }) }),
+  },
+  shell: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.cmd || a.command || a.c || '', ...(a.description ? { description: a.description } : {}) }),
+    translateBack: (a) => ({ command: a.command ?? '', ...(a.description ? { description: a.description } : { description: a.command ?? '' }) }),
+  },
+  run: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.cmd || a.command || '', ...(a.description ? { description: a.description } : {}) }),
+    translateBack: (a) => ({ command: a.command ?? '', ...(a.description ? { description: a.description } : { description: a.command ?? '' }) }),
+  },
+  command: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.cmd || a.command || '', ...(a.description ? { description: a.description } : {}) }),
+    translateBack: (a) => ({ command: a.command ?? '', ...(a.description ? { description: a.description } : { description: a.command ?? '' }) }),
+  },
+  terminal: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.cmd || a.command || '', ...(a.description ? { description: a.description } : {}) }),
+    translateBack: (a) => ({ command: a.command ?? '', ...(a.description ? { description: a.description } : { description: a.command ?? '' }) }),
+  },
+  // `process` is OpenClaw's session-manager tool — it's an action-discriminator
+  // shape {action: "list"|"poll"|"log"|..., sessionId?, ...}. Flattening it onto
+  // Bash.command loses all sibling fields (data, keys, hex, literal, text, ...),
+  // so the model upstream can't actually drive it. Kept mapped for fingerprint
+  // continuity but the reverse translation is inherently lossy — clients with a
+  // process-style tool should use --preserve-tools instead of --hybrid-tools.
+  //
+  // reverseScore: 1 makes sure that when a client declares BOTH `process` AND
+  // `exec`/`bash` (OpenClaw does — both are exported from bash-tools.ts), the
+  // reverse lookup picks the bash-family mapping for CC's Bash tool slot
+  // instead of routing CC tool calls through process's action-based shape
+  // and breaking every Bash call with "Unknown action" (dario#37).
+  // Cline / Roo Code (#40)
+  execute_command: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.command || a.cmd || '', ...(a.description ? { description: a.description } : {}) }),
+    // requires_approval is required by Cline's execute_command schema. Default
+    // to false — CC already gates Bash upstream through its own permission
+    // model, and the borrower controls their own auto-approval settings.
+    translateBack: (a) => ({ command: a.command ?? '', requires_approval: false, ...(a.description ? { description: a.description } : { description: a.command ?? '' }) }),
+  },
+  // Cursor
+  run_terminal_cmd: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.command || '', ...(a.explanation ? { description: a.explanation } : {}) }),
+    translateBack: (a) => ({ command: a.command ?? '', is_background: false, ...(a.description ? { explanation: a.description } : {}) }),
+  },
+  // Windsurf
+  run_command: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.CommandLine || a.command || '' }),
+    translateBack: (a) => ({ CommandLine: a.command ?? '', Blocking: true }),
+  },
+  // Continue.dev
+  builtin_run_terminal_command: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.command || '' }),
+    translateBack: (a) => ({ command: a.command ?? '' }),
+  },
+  // Copilot
+  run_in_terminal: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.command || '', ...(a.explanation ? { description: a.explanation } : {}) }),
+    translateBack: (a) => ({ command: a.command ?? '', ...(a.description ? { explanation: a.description } : {}) }),
+  },
+  // OpenHands
+  execute_bash: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.command || '' }),
+    translateBack: (a) => ({ command: a.command ?? '', is_input: 'false', security_risk: 'LOW' }),
+  },
+  // Note: Hermes `terminal` tool uses the same {command} shape — covered
+  // by the `terminal` entry above.
+  process: {
+    ccTool: 'Bash',
+    translateArgs: (a) => ({ command: a.action || a.cmd || '' }),
+    translateBack: (a) => ({ action: a.command ?? '' }),
+    reverseScore: 1,
+  },
+  read: {
+    ccTool: 'Read',
+    translateArgs: (a) => ({ file_path: a.filePath || a.path || a.file_path || '' }),
+    translateBack: (a) => ({ path: a.file_path ?? '', filePath: a.file_path ?? '' }),
+  },
+  read_file: {
+    ccTool: 'Read',
+    translateArgs: (a) => ({ file_path: a.filePath || a.path || a.file_path || a.target_file || '' }),
+    translateBack: (a) => ({ path: a.file_path ?? '', filePath: a.file_path ?? '', target_file: a.file_path ?? '' }),
+  },
+  // Windsurf
+  view_file: {
+    ccTool: 'Read',
+    translateArgs: (a) => ({ file_path: a.AbsolutePath || a.path || '', ...(a.StartLine ? { offset: a.StartLine } : {}), ...(a.EndLine && a.StartLine ? { limit: Number(a.EndLine) - Number(a.StartLine) + 1 } : {}) }),
+    translateBack: (a) => ({ AbsolutePath: a.file_path ?? '', StartLine: Number(a.offset ?? 1), EndLine: Number(a.offset ?? 1) + Number(a.limit ?? 200) - 1 }),
+  },
+  // Continue.dev
+  builtin_read_file: {
+    ccTool: 'Read',
+    translateArgs: (a) => ({ file_path: a.path || '' }),
+    translateBack: (a) => ({ path: a.file_path ?? '' }),
+  },
+  write: {
+    ccTool: 'Write',
+    translateArgs: (a) => ({ file_path: a.filePath || a.path || a.file_path || '', content: a.content || '' }),
+    translateBack: (a) => ({ path: a.file_path ?? '', filePath: a.file_path ?? '', content: a.content ?? '' }),
+  },
+  write_file: {
+    ccTool: 'Write',
+    translateArgs: (a) => ({ file_path: a.filePath || a.path || a.file_path || '', content: a.content || '' }),
+    translateBack: (a) => ({ path: a.file_path ?? '', filePath: a.file_path ?? '', content: a.content ?? '' }),
+  },
+  // Cline / Roo Code / Windsurf (#40)
+  write_to_file: {
+    ccTool: 'Write',
+    translateArgs: (a) => ({ file_path: a.path || a.filePath || a.file_path || a.TargetFile || '', content: a.content || a.CodeContent || '' }),
+    translateBack: (a) => ({ path: a.file_path ?? '', filePath: a.file_path ?? '', content: a.content ?? '', TargetFile: a.file_path ?? '' }),
+  },
+  // Continue.dev
+  builtin_create_new_file: {
+    ccTool: 'Write',
+    translateArgs: (a) => ({ file_path: a.path || '', content: a.content || '' }),
+    translateBack: (a) => ({ path: a.file_path ?? '', content: a.content ?? '' }),
+  },
+  // Copilot
+  create_file: {
+    ccTool: 'Write',
+    translateArgs: (a) => ({ file_path: a.filePath || a.file_path || a.path || '', content: a.content || '' }),
+    translateBack: (a) => ({ filePath: a.file_path ?? '', content: a.content ?? '' }),
+  },
+  edit: {
+    ccTool: 'Edit',
+    translateArgs: (a) => ({ file_path: a.filePath || a.path || a.file_path || '', old_string: a.oldString || a.old || a.old_string || '', new_string: a.newString || a.new || a.new_string || '' }),
+    translateBack: (a) => ({ path: a.file_path ?? '', filePath: a.file_path ?? '', old: a.old_string ?? '', oldString: a.old_string ?? '', new: a.new_string ?? '', newString: a.new_string ?? '' }),
+  },
+  edit_file: {
+    ccTool: 'Edit',
+    translateArgs: (a) => ({ file_path: a.file_path || a.path || a.target_file || a.filePath || '', old_string: a.old_string || a.old || a.old_str || '', new_string: a.new_string || a.new || a.new_str || '' }),
+    translateBack: (a) => ({ file_path: a.file_path ?? '', old_string: a.old_string ?? '', new_string: a.new_string ?? '' }),
+  },
+  // Cline / Roo Code (#40)
+  replace_in_file: {
+    ccTool: 'Edit',
+    translateArgs: (a) => ({ file_path: a.path || a.filePath || a.file_path || '', old_string: a.old_string || a.old || '', new_string: a.new_string || a.new || '' }),
+    // Cline's schema requires `diff`, not old_string/new_string — formatted as
+    // one SEARCH/REPLACE block (see replace_in_file.ts in cline/cline).
+    translateBack: (a) => ({ path: a.file_path ?? '', diff: `------- SEARCH\n${a.old_string ?? ''}\n=======\n${a.new_string ?? ''}\n+++++++ REPLACE` }),
+  },
+  // Roo Code
+  apply_diff: {
+    ccTool: 'Edit',
+    translateArgs: (a) => ({ file_path: a.path || a.file_path || '', old_string: a.old_string || '', new_string: a.new_string || '' }),
+    translateBack: (a) => ({ path: a.file_path ?? '', diff: '' }),
+    reverseScore: 1,
+  },
+  // Roo Code / Cursor
+  search_replace: {
+    ccTool: 'Edit',
+    translateArgs: (a) => ({ file_path: a.file_path || a.path || '', old_string: a.old_string || '', new_string: a.new_string || '' }),
+    translateBack: (a) => ({ file_path: a.file_path ?? '', old_string: a.old_string ?? '', new_string: a.new_string ?? '' }),
+  },
+  // Continue.dev
+  builtin_edit_existing_file: {
+    ccTool: 'Edit',
+    translateArgs: (a) => ({ file_path: a.path || '', old_string: a.old_string || '', new_string: a.replacement || a.new_string || '' }),
+    translateBack: (a) => ({ path: a.file_path ?? '', replacement: a.new_string ?? '' }),
+  },
+  // Copilot
+  insert_edit_into_file: {
+    ccTool: 'Edit',
+    translateArgs: (a) => ({ file_path: a.filePath || a.file_path || '', old_string: a.old_string || '', new_string: a.code || a.new_string || '' }),
+    translateBack: (a) => ({ filePath: a.file_path ?? '', code: a.new_string ?? '', explanation: '' }),
+  },
+  // OpenHands — only the `str_replace` discriminator is translatable; `view`,
+  // `create`, `insert`, `undo_edit` commands don't fit a 1:1 map into CC's Edit
+  // (view→Read, create→Write, insert→Edit-with-different-semantics) and would
+  // silently produce empty old_string/new_string pairs that CC's Edit tool
+  // rejects. Use --preserve-tools if your OpenHands flow relies on non-
+  // str_replace commands (dario#43).
+  str_replace_editor: {
+    ccTool: 'Edit',
+    translateArgs: (a) => ({ file_path: a.path || '', old_string: a.old_str || '', new_string: a.new_str || '' }),
+    translateBack: (a) => ({ command: 'str_replace', path: a.file_path ?? '', old_str: a.old_string ?? '', new_str: a.new_string ?? '', security_risk: 'LOW' }),
+  },
+  // Hermes — `patch` tool in "replace" mode maps to Edit
+  patch: {
+    ccTool: 'Edit',
+    translateArgs: (a) => ({ file_path: a.path || '', old_string: a.old_string || '', new_string: a.new_string || '' }),
+    translateBack: (a) => ({ mode: 'replace', path: a.file_path ?? '', old_string: a.old_string ?? '', new_string: a.new_string ?? '', replace_all: false }),
+  },
+  glob: { ccTool: 'Glob' },
+  find_files: {
+    ccTool: 'Glob',
+    translateArgs: (a) => ({ pattern: a.pattern || a.query || '' }),
+    translateBack: (a) => ({ pattern: a.pattern ?? '' }),
+  },
+  list_files: {
+    ccTool: 'Glob',
+    translateArgs: (a) => ({ pattern: a.pattern || '*', ...(a.path ? { path: a.path } : {}) }),
+    translateBack: (a) => ({ pattern: a.pattern ?? '', path: a.path ?? '.', recursive: false }),
+  },
+  // Cursor
+  file_search: {
+    ccTool: 'Glob',
+    translateArgs: (a) => ({ pattern: a.glob_pattern || a.query || a.pattern || '' }),
+    translateBack: (a) => ({ glob_pattern: a.pattern ?? '', query: a.pattern ?? '' }),
+  },
+  // Cursor / Windsurf / Copilot
+  list_dir: {
+    ccTool: 'Glob',
+    translateArgs: (a) => ({ pattern: '*', ...(a.target_directory || a.DirectoryPath || a.path ? { path: a.target_directory || a.DirectoryPath || a.path } : {}) }),
+    translateBack: (a) => ({ target_directory: a.path ?? '.', DirectoryPath: a.path ?? '.', path: a.path ?? '.' }),
+    reverseScore: 3,
+  },
+  // Windsurf
+  find_by_name: {
+    ccTool: 'Glob',
+    translateArgs: (a) => ({ pattern: a.Pattern || a.pattern || '*', ...(a.SearchDirectory ? { path: a.SearchDirectory } : {}) }),
+    translateBack: (a) => ({ Pattern: a.pattern ?? '', SearchDirectory: a.path ?? '.' }),
+    reverseScore: 5,
+  },
+  // Continue.dev
+  builtin_file_glob_search: {
+    ccTool: 'Glob',
+    translateArgs: (a) => ({ pattern: a.glob || a.pattern || '' }),
+    translateBack: (a) => ({ glob: a.pattern ?? '' }),
+  },
+  builtin_ls: {
+    ccTool: 'Glob',
+    translateArgs: (a) => ({ pattern: '*', ...(a.path ? { path: a.path } : {}) }),
+    translateBack: (a) => ({ path: a.path ?? '.' }),
+    reverseScore: 1,
+  },
+  grep: { ccTool: 'Grep' },
+  search: {
+    ccTool: 'Grep',
+    translateArgs: (a) => ({ pattern: a.query || a.pattern || '', ...(a.path ? { path: a.path } : {}) }),
+    translateBack: (a) => ({ query: a.pattern ?? '', pattern: a.pattern ?? '', path: a.path ?? '.' }),
+  },
+  search_files: {
+    ccTool: 'Grep',
+    translateArgs: (a) => ({ pattern: a.query || a.pattern || a.regex || '', ...(a.path ? { path: a.path } : {}), ...(a.filePattern || a.file_pattern ? { glob: a.filePattern || a.file_pattern } : {}) }),
+    translateBack: (a) => ({ query: a.pattern ?? '', pattern: a.pattern ?? '', regex: a.pattern ?? '', path: a.path ?? '.', filePattern: a.glob ?? '', file_pattern: a.glob ?? '' }),
+  },
+  // Cursor / Windsurf
+  grep_search: {
+    ccTool: 'Grep',
+    translateArgs: (a) => ({ pattern: a.pattern || a.query || a.Query || '', ...(a.path || a.SearchPath ? { path: a.path || a.SearchPath } : {}), ...(a.glob ? { glob: a.glob } : {}), ...(Array.isArray(a.Includes) && a.Includes[0] ? { glob: a.Includes[0] } : {}) }),
+    translateBack: (a) => ({ pattern: a.pattern ?? '', Query: a.pattern ?? '', path: a.path ?? '.', SearchPath: a.path ?? '.', ...(a.glob ? { glob: a.glob } : {}) }),
+  },
+  // Cursor / Windsurf / Roo Code / Copilot
+  codebase_search: {
+    ccTool: 'Grep',
+    translateArgs: (a) => ({ pattern: a.query || a.Query || a.pattern || '' }),
+    translateBack: (a) => ({ query: a.pattern ?? '', Query: a.pattern ?? '' }),
+    reverseScore: 3,
+  },
+  // Continue.dev
+  builtin_grep_search: {
+    ccTool: 'Grep',
+    translateArgs: (a) => ({ pattern: a.pattern || '', ...(a.path ? { path: a.path } : {}) }),
+    translateBack: (a) => ({ pattern: a.pattern ?? '', path: a.path ?? '.' }),
+  },
+  // Copilot
+  semantic_search: {
+    ccTool: 'Grep',
+    translateArgs: (a) => ({ pattern: a.query || '' }),
+    translateBack: (a) => ({ query: a.pattern ?? '' }),
+    reverseScore: 2,
+  },
+  web_search: {
+    ccTool: 'WebSearch',
+    translateArgs: (a) => ({ query: a.query || a.search_term || a.q || '' }),
+    translateBack: (a) => ({ query: a.query ?? '', search_term: a.query ?? '' }),
+  },
+  websearch: {
+    ccTool: 'WebSearch',
+    translateArgs: (a) => ({ query: a.query || a.q || '' }),
+    translateBack: (a) => ({ query: a.query ?? '' }),
+  },
+  web_fetch: {
+    ccTool: 'WebFetch',
+    translateArgs: (a) => webFetchArgs(a.url || a.u, a.prompt),
+    translateBack: (a) => ({ url: a.url ?? '' }),
+  },
+  webfetch: {
+    ccTool: 'WebFetch',
+    translateArgs: (a) => webFetchArgs(a.url || a.u, a.prompt),
+    translateBack: (a) => ({ url: a.url ?? '' }),
+  },
+  fetch: {
+    ccTool: 'WebFetch',
+    translateArgs: (a) => webFetchArgs(a.url, a.prompt),
+    translateBack: (a) => ({ url: a.url ?? '' }),
+  },
+  browse: {
+    ccTool: 'WebFetch',
+    translateArgs: (a) => webFetchArgs(a.url, a.prompt),
+    translateBack: (a) => ({ url: a.url ?? '' }),
+  },
+  // Windsurf
+  read_url_content: {
+    ccTool: 'WebFetch',
+    translateArgs: (a) => webFetchArgs(a.Url || a.url, a.prompt),
+    translateBack: (a) => ({ Url: a.url ?? '', url: a.url ?? '' }),
+  },
+  // Hermes — web_extract takes {urls: [...]} but we map the first URL
+  web_extract: {
+    ccTool: 'WebFetch',
+    translateArgs: (a) => webFetchArgs(Array.isArray(a.urls) ? a.urls[0] : a.url, a.prompt),
+    translateBack: (a) => ({ urls: [a.url ?? ''] }),
+  },
+  // Copilot — fetch_webpage carries an intent field as `query`; promote
+  // it to WebFetch's prompt so upstream sees what the client wanted.
+  fetch_webpage: {
+    ccTool: 'WebFetch',
+    translateArgs: (a) => webFetchArgs(a.url, a.query || a.prompt),
+    translateBack: (a) => ({ url: a.url ?? '' }),
+  },
+  // Windsurf
+  search_web: {
+    ccTool: 'WebSearch',
+    translateArgs: (a) => ({ query: a.query || '' }),
+    translateBack: (a) => ({ query: a.query ?? '' }),
+  },
+  // Continue.dev
+  builtin_search_web: {
+    ccTool: 'WebSearch',
+    translateArgs: (a) => ({ query: a.query || '' }),
+    translateBack: (a) => ({ query: a.query ?? '', num_results: 5 }),
+  },
+  notebook: { ccTool: 'NotebookEdit' },
+  notebook_edit: { ccTool: 'NotebookEdit' },
+  // Additional client tool mappings
+  browser: {
+    ccTool: 'WebFetch',
+    translateArgs: (a) => webFetchArgs(a.url, a.prompt),
+    translateBack: (a) => ({ url: a.url ?? '' }),
+  },
+  // Intentionally unmapped (dario#43): the `message`, `ask_followup_question`
+  // (Cline/Roo), and `clarify` (Hermes) tools are free-form "ask the user one
+  // question" shapes. CC's AskUserQuestion requires a structured
+  // `{questions: [{question, options: [min 2]}]}` shape with multi-option
+  // answers — synthesizing fake yes/no options would distort what the client's
+  // agent actually asked and mislead the model about the user's real choices.
+  // Falling through to unmapped-tool handling is strictly more honest:
+  //   • default mode → round-robin to a fallback CC tool (lossy but upstream
+  //     won't reject the request);
+  //   • hybrid mode → dropped, so the model doesn't see a broken tool;
+  //   • --preserve-tools → client's real schema flows through untouched
+  //     (recommended for agents that depend on ask-user flows).
+  // Intentionally unmapped (CC v2.1.142): Anthropic removed TodoWrite /
+  // TodoRead from the CC tool catalog in favor of the Task* family
+  // (TaskCreate / TaskGet / TaskList / TaskOutput / TaskStop / TaskUpdate).
+  // The previous `todo_read`/`todo_write` → `TodoWrite` mappings now point
+  // at a destination tool that no longer exists in the bundled or live
+  // template, so the schema-contract test correctly fails for them.
+  //
+  // We drop the mappings rather than remap to Task* because the semantics
+  // diverge: TodoWrite replaced an entire flat todo list per call; Task*
+  // is single-task-by-ID. A `todo_write` → `TaskCreate` rewrite would
+  // silently truncate a list-write to creating only the first item. The
+  // unmapped-tool path handles legacy clients honestly:
+  //   • default mode → round-robin to a fallback CC tool (lossy but the
+  //     upstream accepts the request);
+  //   • hybrid mode → dropped, so the model doesn't see a phantom tool;
+  //   • --preserve-tools → client's real schema flows through untouched
+  //     (recommended for clients that actually depend on todo semantics).
+  //
+  // Intentionally unmapped (dario#43): CC has no notebook-read tool, and
+  // routing a read to NotebookEdit with empty new_source either fails the
+  // schema (`new_source` required) or executes a destructive no-op edit.
+  // Clients with notebook-read should use --preserve-tools.
+  enter_plan_mode: { ccTool: 'EnterPlanMode' },
+  exit_plan_mode: { ccTool: 'ExitPlanMode' },
+  enter_worktree: {
+    ccTool: 'EnterWorktree',
+    translateArgs: (a) => ({ path: a.path }),
+    translateBack: (a) => ({ path: a.path ?? '' }),
+  },
+  exit_worktree: { ccTool: 'ExitWorktree' },
+};
+
+/**
+ * Build a CC-template request from a client request.
+ * Replaces the entire request structure — tools, fields, ordering — with
+ * what real CC sends. Only the conversation content is preserved.
+ */
+/** Default outbound max_tokens when neither a passthrough nor an explicit value is set. Tracks CC's wire default — 32000 in 2.1.116, 64000 in 2.1.143 (verified via `scripts/capture-full-body.mjs` 2026-05-17). */
+export const DEFAULT_MAX_TOKENS = 64000;
+
+/**
+ * Resolve the outbound `max_tokens` value.
+ *
+ *   undefined / 32000 etc. → number pins outbound (preserves dario's CC-wire default)
+ *   'client' → extract from `clientBody.max_tokens`; fall back to DEFAULT_MAX_TOKENS
+ *              when the client didn't send a value or sent something non-numeric
+ *
+ * dario#88 (Hermes compat — Hermes requests up to 128k for Opus 4.7, 64k for
+ * Sonnet; pinning to 32k silently truncated its output capacity).
+ */
+export function resolveMaxTokens(flag: number | 'client' | undefined, clientBody: Record<string, unknown>): number {
+  if (flag === undefined) return DEFAULT_MAX_TOKENS;
+  if (flag === 'client') {
+    const clientMT = clientBody.max_tokens;
+    if (typeof clientMT === 'number' && Number.isFinite(clientMT) && clientMT > 0) return Math.floor(clientMT);
+    return DEFAULT_MAX_TOKENS;
+  }
+  return flag;
+}
+
+// The effort vocabulary and the model-name effort suffix live in effort.ts so
+// the pool-fallback classifier can parse the SAME suffix the request path
+// parses without importing this module — claude-model.ts stays decidable over
+// a base set alone, and hand-copying the suffix list there is what would let
+// `claude:opus:high` drift from `opus:high` (dario#1156 review). Re-exported
+// here because proxy.ts, cli.ts and test/effort-flag.mjs import them from
+// cc-template.
+export { VALID_EFFORT_VALUES, parseEffortSuffix };
+export type { EffortValue };
+
+/**
+ * Normalize an effort value to a wire-valid `output_config.effort`. The
+ * Messages API accepts only low|medium|high|xhigh|max. CC's `ultracode` is a
+ * client mode (xhigh effort + dynamic workflow orchestration), NOT a wire
+ * value, so it rides on `xhigh`; forwarding 'ultracode' literally 400s.
+ */
+function normalizeEffortForWire(effort: string): string {
+  return effort === 'ultracode' ? 'xhigh' : effort;
+}
+
+/**
+ * Resolve the outbound `output_config.effort` value.
+ *
+ * Effort is a USER KNOB, not a wire constant: real CC sends whatever the
+ * user's effort setting is tuned to, and "what CC sends" in a capture is just
+ * that install's knob position. dario chased captured values for months
+ * ('medium' → 'high' → 'xhigh' across CC releases — each one somebody's
+ * setting, not a version default) and pinned the outbound effort to a fixed
+ * value, silently clamping every client's explicit choice. Since 4.8.142 the
+ * default is client-first, matching how real CC actually behaves:
+ *
+ *   undefined / 'client' → the client's `clientBody.output_config.effort`
+ *              (normalized for the wire) — forward the knob untouched.
+ *              Falls back to 'high' only when the client sent none
+ *              (OpenAI-compat clients that can't set effort).
+ *   'low' / 'medium' / 'high' / 'xhigh' / 'max' → operator pin via
+ *              --effort / DARIO_EFFORT (explicit override, wins over client)
+ *   'ultracode' → 'xhigh' (CC's ultracode mode; xhigh on the wire)
+ *
+ * The 'high' fallback (not 'max') is dario#658 scar tissue: 'max' plus
+ * unbounded adaptive thinking exhausts max_tokens on long prompts — the
+ * stream ends `stop_reason: max_tokens` with ZERO text blocks. 'high' thinks
+ * proportionally and leaves room for the answer. A client that explicitly
+ * asks for 'max' gets 'max' — same outcome it would get talking to Anthropic
+ * directly.
+ *
+ * FABLE CLAMP — REMOVED 2026-07-01. Fable 5 was SUSPENDED 2026-06-12 (US-gov
+ * directive) and REDEPLOYED 2026-07-01. The pre-suspension model (2026-06-09
+ * replay bisect) soft-refused `max`/`xhigh` (200 + stop_reason "refusal") and
+ * defaulted to `high`; dario special-cased it. A fresh live replay on 2026-07-01
+ * through the deployed proxy (CC 2.1.198's verbatim fable body, only
+ * output_config.effort mutated) shows the redeployed fable now ANSWERS all three
+ * — high/xhigh/max → end_turn, zero refusals. So the clamp + the fable-only
+ * default are gone: fable takes the general path, matching how dario treats
+ * opus. `model` is retained in the signature in case a future model needs
+ * per-family effort handling again.
+ *
+ * Exported for tests.
+ */
+export function resolveEffort(flag: EffortValue | undefined, clientBody: Record<string, unknown>, model?: string): string {
+  void model; // no per-family effort handling at present (see FABLE CLAMP note above)
+  const fallback = 'high';
+  if (flag === undefined || flag === 'client') {
+    const clientOC = clientBody.output_config as { effort?: unknown } | undefined;
+    const clientEffort = clientOC?.effort;
+    if (typeof clientEffort === 'string' && clientEffort.length > 0) return normalizeEffortForWire(clientEffort);
+    return fallback;
+  }
+  return normalizeEffortForWire(flag);
+}
+
+/**
+ * Returns true if the given model accepts `thinking: { type: "adaptive" }`.
+ *
+ * Empirical results (2026-05-15, live OAuth-subscription probes against
+ * api.anthropic.com — see dario#NNN for the probe matrix):
+ *   claude-opus-5      ✓ accepts adaptive (2026-07-24 — Opus 5 runs adaptive
+ *                        by DEFAULT: unlike 4.8/4.7, an omitted `thinking`
+ *                        field still thinks. dario sends it explicitly either
+ *                        way, and never sends `{type:"disabled"}` — which on
+ *                        this model 400s above `high` effort)
+ *   claude-opus-4-8    ✓ accepts adaptive (verified 2026-05-28)
+ *   claude-opus-4-7    ✓ accepts adaptive
+ *   claude-opus-4-6    ✓ accepts adaptive
+ *   claude-sonnet-4-6  ✓ accepts adaptive
+ *   claude-fable-5     ✓ accepts adaptive (2026-06-09 — Fable 5 is CC's new
+ *                        flagship and real CC sends `thinking:{type:"adaptive"}`
+ *                        on it, incl. the `claude-fable-5[1m]` long-context id)
+ *   claude-opus-4-5    ✗ "adaptive thinking is not supported on this model"
+ *   claude-sonnet-4-5  ✗ same
+ *   claude-haiku-4-5   ✗ same (already gated separately by isHaiku)
+ *
+ * The split is the 4.6 minor: Anthropic added adaptive support in the 4.6
+ * generation. Beta header state does not affect the outcome — adaptive is
+ * gated per-model, server-side.
+ *
+ * Allow-list pattern, default-deny: when a future model ships and isn't
+ * yet listed here, dario silently OMITS the `thinking` field rather than
+ * 400ing. Omitting `thinking` is always accepted by the API, so the
+ * worst-case regression is "no thinking blocks until allow-list update"
+ * — never a broken request.
+ */
+export function supportsAdaptiveThinking(modelId: string): boolean {
+  const m = modelId.toLowerCase();
+  // Opus/Sonnet/Fable, major-minor form: opus-4-6+, sonnet-4-6+, opus-5-X,
+  // fable-5-X, etc. (Fable launched at 5 — there is no fable-4 line — so the
+  // shared "4-6+" threshold is correct for it by construction.)
+  //
+  // Digit groups are bounded to {1,2} so the dated-suffix pre-4.x line
+  // (`claude-3-5-sonnet-20241022`, `claude-3-7-sonnet-20250219`) doesn't
+  // accidentally match the date as `sonnet-2024-1022` and parse year as
+  // major. Realistic Anthropic version numbers are 1-2 digits.
+  const mm = m.match(/(?:opus|sonnet|fable)-(\d{1,2})-(\d{1,2})\b/);
+  if (mm) {
+    const major = Number(mm[1]);
+    const minor = Number(mm[2]);
+    if (major > 4) return true;                       // any opus-5+ / sonnet-5+ / fable-5+
+    if (major === 4 && minor >= 6) return true;       // 4-6, 4-7, …
+    return false;                                     // 4-5 and older
+  }
+  // Major-only form (e.g. `opus-5`, `fable-5`, `opus-10`). The negative
+  // lookahead prevents matching the `5` in `opus-5-X` (handled above), and
+  // the {1,2} bound prevents matching long dated suffixes. A trailing
+  // context tag (`claude-fable-5[1m]`) is fine: `[` is neither digit nor
+  // hyphen, so the lookahead passes.
+  const majorOnly = m.match(/(?:opus|sonnet|fable)-(\d{1,2})(?!\d|-)/);
+  if (majorOnly && Number(majorOnly[1]) >= 5) return true;
+  return false;
+}
+
+/**
+ * Anthropic prompt-cache control. `ttl` is the cache lifetime: `5m` (the
+ * upstream default when omitted) or `1h`. Real CC sends `1h` on its system
+ * blocks (see live-fingerprint.ts extractTemplate), so dario mirrors it.
+ */
+export type CacheControl = { type: 'ephemeral'; ttl?: '5m' | '1h' };
+
+/**
+ * The cache-control dario stamps on every breakpoint (2 system + 2
+ * conversation). Plain `{type:'ephemeral'}` (the 5-minute default) mirrors
+ * real CC: a loopback MITM capture of CC v2.1.203 shows no `ttl` field on any
+ * breakpoint. v4.8.140 stamped `ttl:'1h'` here on the theory that real CC
+ * used 1h — it doesn't, and 1h cache WRITES bill at 2x base input vs 1.25x
+ * for 5m, so every write in a write-heavy agentic session cost 60% more than
+ * direct CC. The dario#678 re-test caught it: the reporter's cold-start burn
+ * went +8% -> +19% on the "fixed" build. Single source of truth so the
+ * emitted shape can't drift from CC again.
+ */
+export const CC_CACHE_CONTROL: CacheControl = { type: 'ephemeral' };
+
+/**
+ * The cache control the CLIENT asked for, read from its own stamps — or
+ * CC_CACHE_CONTROL when it stamped nothing.
+ *
+ * Real CC implements the subscription-vs-overage TTL selection itself:
+ * on included subscription usage it sends `ttl:'1h'` on every breakpoint
+ * plus `extended-cache-ttl-2025-04-11` in `anthropic-beta`, and drops to
+ * bare 5m stamps when drawing on usage credits (loopback capture of CC
+ * v2.1.209 under subscription OAuth, 2026-07-14 — dario#678; docs:
+ * code.claude.com/docs/en/prompt-caching#cache-lifetime). The client's
+ * stamps are therefore the billing-correct answer, and dario mirrors them
+ * instead of overwriting with the 5m default — deleting them forced every
+ * proxied subscription session onto a 5m cache, so any >5-minute pause
+ * re-paid cache creation on the full prefix.
+ *
+ * The ttl is mirrored only when the client's `anthropic-beta` also carries
+ * `extended-cache-ttl-` (CC always sends the pair together); a ttl stamp
+ * without the enabling beta is not a shape real CC produces, and forwarding
+ * half of it risks an upstream 400. DARIO_CACHE_TTL_5M=1 restores the
+ * pre-fix behavior (always bare 5m) as the operator escape hatch.
+ *
+ * DARIO_CACHE_TTL_1H=1 is the opposite override: force `ttl:'1h'` on every
+ * breakpoint regardless of what the client sent, for a client that can't
+ * emit the 1h stamp itself (an SDK/agent harness that only stamps bare 5m —
+ * dario#678). The proxy adds the enabling `extended-cache-ttl-` beta to the
+ * outbound set so the 1h is honored. Deliberate override of the mirror
+ * guardrail: 1h cache *writes* bill ~2× the 5m rate, so it only wins when
+ * idle gaps routinely exceed the 5-minute window; on rapid back-to-back
+ * turns it costs more. 5M takes precedence if both are set.
+ */
+export function effectiveCacheControl(
+  clientBody: Record<string, unknown>,
+  clientBeta?: string,
+): CacheControl {
+  if (process.env['DARIO_CACHE_TTL_5M'] === '1') return CC_CACHE_CONTROL;
+  if (process.env['DARIO_CACHE_TTL_1H'] === '1') return { type: 'ephemeral', ttl: '1h' };
+  if (!clientBeta || !clientBeta.includes('extended-cache-ttl-')) return CC_CACHE_CONTROL;
+  const scan = (blocks: unknown): CacheControl | null => {
+    if (!Array.isArray(blocks)) return null;
+    for (const b of blocks) {
+      const cc = (b as Record<string, unknown> | null)?.cache_control as CacheControl | undefined;
+      if (cc && (cc.ttl === '1h' || cc.ttl === '5m')) return { type: 'ephemeral', ttl: cc.ttl };
+    }
+    return null;
+  };
+  const fromSystem = scan(clientBody.system);
+  if (fromSystem) return fromSystem;
+  const msgs = clientBody.messages;
+  if (Array.isArray(msgs)) {
+    for (const m of msgs) {
+      const hit = scan((m as Record<string, unknown> | null)?.content);
+      if (hit) return hit;
+    }
+  }
+  return CC_CACHE_CONTROL;
+}
+
+/** The anthropic-beta flag that enables the 1-hour prompt-cache TTL. */
+export const EXTENDED_CACHE_TTL_BETA = 'extended-cache-ttl-2025-04-11';
+
+/**
+ * When DARIO_CACHE_TTL_1H forces the 1h stamp, the outbound beta set must also
+ * carry `extended-cache-ttl-` or Anthropic ignores the ttl. Add it (idempotent)
+ * unless DARIO_CACHE_TTL_5M overrides (5M wins, matching effectiveCacheControl).
+ * Pure — `env` is injectable for tests. Returns `beta` unchanged when the flag
+ * is off or the beta is already present.
+ */
+export function withForced1hBeta(beta: string, env: Record<string, string | undefined> = process.env): string {
+  if (env['DARIO_CACHE_TTL_1H'] !== '1' || env['DARIO_CACHE_TTL_5M'] === '1') return beta;
+  if (beta.split(',').includes(EXTENDED_CACHE_TTL_BETA)) return beta;
+  return beta.length > 0 ? beta + ',' + EXTENDED_CACHE_TTL_BETA : EXTENDED_CACHE_TTL_BETA;
+}
+
+/**
+ * Place CC-style prompt-cache breakpoints on the conversation. The system
+ * prompt is already cached at build time (2 system breakpoints); this adds a
+ * rolling breakpoint on the last user message plus an anchor on the previous
+ * one — total 4, the Anthropic max.
+ *
+ * Placement mirrors a live capture of CC v2.1.203 (dario#678):
+ *
+ *  - Tools carry NO breakpoint. Real CC sends its tool array unstamped —
+ *    Anthropic renders tools -> system -> messages, so the system breakpoints
+ *    already cache the tools prefix. Stamping the last tool (pre-4.8.142) both
+ *    diverged from CC's wire shape and spent the fourth slot the conversation
+ *    anchor below needs.
+ *
+ *  - The rolling breakpoint goes on the last USER message, not the last
+ *    message. CC skips trailing role:"system" injections (agent-type updates
+ *    etc.); stamping "the last message" meant any turn ending in one wrote no
+ *    conversation entry at all, and the next request re-paid the entire
+ *    history as fresh input.
+ *
+ *  - The previous user message is anchored too. Anthropic's cache lookup
+ *    walks back at most ~20 content blocks from a breakpoint; one parallel-
+ *    tool turn (N tool_use + N tool_result blocks) can exceed that alone, and
+ *    the rolling breakpoint then can't reach the prior turn's entry — the
+ *    whole conversation re-bills at cache-WRITE cost every fan-out turn,
+ *    which is the dario#678 burn ("read every file" sessions draining the
+ *    Max window ~10x faster than direct CC). The anchor sits exactly where
+ *    the previous request's rolling breakpoint was, so the lookup hits it
+ *    positionally with no walk-back.
+ *
+ * Exported for unit testing.
+ */
+/**
+ * A text block upstream treats as empty. `cache_control` on one of these is a
+ * hard 400, so breakpoint placement must skip them.
+ */
+function isEmptyTextBlock(block: Record<string, unknown> | undefined): boolean {
+  return block?.type === 'text' && (typeof block.text !== 'string' || block.text === '');
+}
+
+export function applyCcPromptCaching(
+  ccRequest: Record<string, unknown>,
+  cacheControl: CacheControl,
+): void {
+  // Tools — strip any stray client breakpoints (they'd count against the
+  // 4-breakpoint budget) without mutating shared element objects
+  // (CC_TOOL_DEFINITIONS is a module constant).
+  const tools = ccRequest.tools as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(tools) && tools.length > 0) {
+    ccRequest.tools = tools.map((t) => {
+      if (!('cache_control' in t)) return t;
+      const copy = { ...t };
+      delete copy.cache_control;
+      return copy;
+    });
+  }
+  // Conversation — last two user messages, walking backward. Client
+  // breakpoints were already stripped upstream. Only block-array content gets
+  // a breakpoint: string content (some SDK clients) is left untouched —
+  // wrapping it would change the wire shape, and a bare string user turn is
+  // tiny anyway. Real CC / agentic sessions use block arrays, which DO cache.
+  const msgs = ccRequest.messages as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(msgs) && msgs.length > 0) {
+    let stamped = 0;
+    for (let i = msgs.length - 1; i >= 0 && stamped < 2; i--) {
+      const msg = msgs[i];
+      if (msg.role !== 'user') continue;
+      if (!Array.isArray(msg.content) || msg.content.length === 0) continue;
+      const blocks = msg.content as Array<Record<string, unknown>>;
+      // Walk back past empty text blocks. Upstream rejects the whole request
+      // with 400 "cache_control cannot be set for empty text blocks", so a
+      // trailing empty text block would otherwise kill every request from
+      // that turn onward (dario#1066). A turn with nothing else to stamp is
+      // skipped rather than stamped illegally — it keeps its cache entry via
+      // the next turn's anchor.
+      let bi = blocks.length - 1;
+      while (bi >= 0 && isEmptyTextBlock(blocks[bi])) bi--;
+      if (bi < 0) continue;
+      blocks[bi] = { ...blocks[bi], cache_control: cacheControl };
+      stamped++;
+    }
+  }
+}
+
+/**
+ * Drop later tools whose exact name already appeared. Upstream rejects the
+ * whole request with 400 "tools: Tool names must be unique" on any repeat,
+ * so this is the last-line guard on the assembled advertise array — a
+ * polluted live template (see the mcp__ exclusion at the availableCC build)
+ * or a client double-declare degrades to first-wins instead of a hard
+ * request failure. Exported for tests.
+ */
+export function dedupeToolsByName<T extends { name?: unknown }>(tools: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const t of tools) {
+    const name = typeof t.name === 'string' ? t.name : '';
+    if (name && seen.has(name)) continue;
+    if (name) seen.add(name);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * A genuine Claude Code client is identified by TWO markers together:
+ * the `x-anthropic-billing-header:` system block at [0] (the discriminator
+ * extractSystemText and extractTemplate key on) AND a CC-origin block at [1].
+ * Requiring both keeps a non-CC framework that replays a billing-tagged body
+ * (e.g. a Kilo client behind a second proxy hop) on the detector path instead
+ * of passthrough. Exported for tests.
+ *
+ * CC is not one request shape. Besides the main loop ("You are Claude Code…" /
+ * the Claude Agent SDK variant), a single CC session also emits:
+ *  - sub-agent (Task/Agent tool) requests — system[1] is the agent prompt,
+ *    "You are an agent for Claude Code, Anthropic's official CLI for
+ *    Claude.…" (exact bytes in the CC v2.1.205 bundle; it neither starts
+ *    with "You are Claude Code" nor mentions the Agent SDK), and
+ *  - auto-mode permission-classifier requests — system[1] is the ~106KB
+ *    "You are a security monitor for autonomous AI coding agents" prompt,
+ *    fired once per gated tool call (live-captured via loopback MITM).
+ * Both missed the v4.8.146 detector and fell onto the template path, where
+ * the ~25KB template prepend re-billed per request shape per cache window —
+ * the #678 remote re-test burned +19% vs +2% direct on exactly the run where
+ * CC fanned out parallel sub-agents. Openers are matched with startsWith,
+ * same anti-replay posture as the main-loop marker: none of them appear at
+ * system[1] in any known non-CC framework's wire shape.
+ *
+ * The built-in named agents (Explore, Plan) carry their own specialist
+ * prompts — neither opens with the main-loop or general-purpose markers, so
+ * they missed the v4.8.148 detector and stayed on the template path. That
+ * was the #678 reporter's residual: on v4.8.148, forced parallel sub-agents
+ * (a "read every file" prompt CC routes to Explore-type agents) still burned
+ * ~3x the direct per-spawn cost. Openers are the exact bytes from the CC
+ * v2.1.205 bundle; the drift-watch pipeline is the guard when they move.
+ *
+ * Known gap: CUSTOM agents (~/.claude/agents) put operator-authored
+ * definition text at system[1] with no stable CC marker — those still ride
+ * the template path. There is no universal appended sentinel to key on (the
+ * report-instruction sentence is baked into the general-purpose prompt only),
+ * so a durable structural discriminator (e.g. billing block + claude-cli
+ * user-agent) is a design decision for a follow-up.
+ */
+const CC_ORIGIN_SYSTEM_OPENERS = [
+  'You are Claude Code',                                        // main loop, cli entrypoint
+  'You are an agent for Claude Code',                           // general-purpose sub-agent (Task/Agent tool)
+  'You are a file search specialist for Claude Code',           // built-in Explore agent (exact bytes, CC v2.1.205 bundle)
+  'You are a software architect and planning specialist for Claude Code', // built-in Plan agent (exact bytes, CC v2.1.205 bundle)
+  'You are a security monitor for autonomous AI coding agents', // auto-mode permission classifier
+] as const;
+
+export function isGenuineCCClient(clientBody: Record<string, unknown>): boolean {
+  const sys = clientBody.system;
+  if (!Array.isArray(sys) || sys.length < 2) return false;
+  const first = sys[0] as { text?: unknown } | undefined;
+  if (typeof first?.text !== 'string' || !first.text.includes('x-anthropic-billing-header:')) return false;
+  const second = sys[1] as { text?: unknown } | undefined;
+  if (typeof second?.text !== 'string') return false;
+  const text = second.text;
+  return CC_ORIGIN_SYSTEM_OPENERS.some((opener) => text.startsWith(opener)) || text.includes('Claude Agent SDK');
+}
+
+/**
+ * The client's tool_choice, when it can be honoured against the tools going out: `auto`, `any`
+ * and `none` always; a forced `{type:'tool', name}` with the name translated the way the tool
+ * itself was (remap mode: the client name -> its CC tool or fallback slot; preserve mode: the
+ * map is empty and the name is the client's), and only when that name is in `outgoingTools`.
+ * Anything else, including a malformed value, yields null and the request goes out without one.
+ * Exported for unit testing.
+ */
+export function passthroughToolChoice(
+  choice: unknown,
+  outgoingTools: Array<{ name?: unknown }> | undefined,
+  toolMap: ReadonlyMap<string, { ccTool: string }> = new Map(),
+): Record<string, unknown> | null {
+  if (!choice || typeof choice !== 'object' || Array.isArray(choice)) return null;
+  const c = choice as Record<string, unknown>;
+  if (c.type === 'auto' || c.type === 'any' || c.type === 'none') return c;
+  if (c.type === 'tool' && typeof c.name === 'string') {
+    const name = toolMap.get(c.name)?.ccTool ?? c.name;
+    return (outgoingTools ?? []).some((t) => t.name === name) ? { ...c, name } : null;
+  }
+  return null;
+}
+
+export function buildCCRequest(
+  clientBody: Record<string, unknown>,
+  billingTag: string,
+  cacheControl: CacheControl,
+  identity: { deviceId: string; accountUuid: string; sessionId: string },
+  opts: { preserveTools?: boolean; hybridTools?: boolean; mergeTools?: boolean; noAutoDetect?: boolean; effort?: EffortValue; maxTokens?: number | 'client'; systemPrompt?: string; skipFields?: ReadonlySet<string>; honorClientThinking?: boolean; preserveOutputFormat?: boolean } = {},
+): { body: Record<string, unknown>; toolMap: Map<string, ToolMapping>; unmappedTools: string[]; carriedAsMcp?: string[]; detectedClient?: string; genuineCC?: boolean } {
+
+  const model = clientBody.model as string || 'claude-sonnet-5';
+  const isHaiku = model.toLowerCase().includes('haiku');
+  const messages = clientBody.messages as Array<Record<string, unknown>> || [];
+  const clientTools = clientBody.tools as Array<Record<string, unknown>> | undefined;
+  const stream = clientBody.stream ?? false;
+
+  // ── Drop empty text blocks from history (ALL paths) ──
+  // Upstream rejects empty text blocks OUTRIGHT — stamped or not — and treats
+  // whitespace-only text the same way ("messages: text content blocks must be
+  // non-empty"; with a breakpoint on it, "cache_control cannot be set for
+  // empty text blocks"). One such block entering the transcript mid-run
+  // therefore killed every subsequent request of the session (dario#1066).
+  // Filtering here fixes the REQUEST, which no breakpoint guard can: skipping
+  // the stamp still leaves the illegal block on the wire.
+  //
+  // Sits ABOVE the genuine-CC early return on purpose. #1067 placed this
+  // below it, where real Claude Code — the one client whose messages are
+  // forwarded verbatim — never reached it, and the #1066 session-killer
+  // survived on exactly the client it hurts most (dario#1077). An empty text
+  // block is not a wire shape the client is authority over; it is a
+  // guaranteed upstream 400. `messages` aliases clientBody.messages, so
+  // these mutations reach the genuine-CC body, which spreads clientBody.
+  for (const msg of messages) {
+    if (!Array.isArray(msg.content)) continue;
+    msg.content = (msg.content as Array<Record<string, unknown>>).filter(
+      (b) => !(b.type === 'text' && (typeof b.text !== 'string' || (b.text as string).trim() === '')),
+    );
+  }
+  // A turn left with no blocks is dropped — but only MID-conversation, where
+  // the API combines the now-adjacent same-role turns and where the #1066
+  // session-killer lives (the empty turn sits in history, so every later
+  // request carries it). BOTH roles: a user turn whose only block was empty,
+  // and an assistant turn the filter emptied (a null/non-string text block the
+  // proxy-level string scrub leaves behind, dario#1092) — either one mid-stream
+  // is "messages.N: … content must contain at least one block" upstream. The
+  // FINAL turn is deliberately left in place per the dario#1033 decision below:
+  // popping it would expose the assistant turn behind it and convert an honest
+  // "content must contain at least one block" into a misleading prefill
+  // rejection. Hoisted with the filter (dario#1077): removing a block can empty
+  // a turn on any path.
+  for (let i = messages.length - 2; i >= 0; i--) {
+    const m = messages[i];
+    if (Array.isArray(m.content) && (m.content as unknown[]).length === 0) {
+      messages.splice(i, 1);
+    }
+  }
+  // A TRAILING assistant turn the filter emptied is dropped too — content: []
+  // at the end reads as a prefill upstream, which Opus under adaptive thinking
+  // + the claude-code beta refuses outright. This is a copy of the trailing
+  // drop further down (which must ALSO stay there, running after the general
+  // path's thinking strip — the shape it was written for); the copy exists so
+  // the genuine-CC early return inherits it (dario#1077 follow-up: stage 3 of
+  // 3, the "failure moves rather than disappears" case). Same constraints as
+  // the original: assistant turns ONLY — popping an empty final user turn
+  // would convert an honest "content must contain at least one block" into a
+  // misleading prefill rejection (dario#1033), and popping a NON-empty
+  // trailing assistant is the OpenClaw runaway loop (#37). Idempotent, so
+  // running it twice on the general path changes nothing.
+  while (messages.length > 0) {
+    const last = messages[messages.length - 1];
+    if (last.role === 'assistant' && Array.isArray(last.content) && (last.content as unknown[]).length === 0) {
+      messages.pop();
+      continue;
+    }
+    break;
+  }
+
+  // ── Genuine Claude Code client → byte-faithful passthrough ──
+  // A real CC request already IS the CC wire shape. Replacing its system
+  // prompt with the template (prepending ~25KB per request shape) and
+  // substituting template tool defs was pure duplication: it re-billed the
+  // doubled prompt per shape per cache window (the residual +5%-vs-direct in
+  // the dario#678 re-test), drifted the tool schemas whenever the client's CC
+  // version differed from the template's, and round-robin-mangled natives the
+  // `--print`-mode template capture never sees (AskUserQuestion, plan-mode
+  // tools). Forward system blocks and tools verbatim. dario still owns:
+  //   - system[0]: dario's billing tag (consistent with dario's headers),
+  //   - metadata.user_id: dario's identity (the OAuth account is dario's,
+  //     not the client's),
+  //   - cache breakpoints: client stamps are stripped and re-placed (system
+  //     here, conversation in applyCcPromptCaching) so the 4-breakpoint
+  //     budget stays deterministic.
+  // Messages, thinking, effort, max_tokens, top-level key order: untouched —
+  // the client is the authority on its own wire shape. One exception, the
+  // empty-text filter above (dario#1077): a guaranteed upstream 400 is a
+  // defect, not a wire-shape preference. Outranks the tool-mode flags: those
+  // configure how NON-CC clients are dressed up as CC, which a genuine CC
+  // client doesn't need.
+  if (isGenuineCCClient(clientBody)) {
+    // ── dario#1092: recover an empty FINAL user turn (genuine CC only) ──
+    // CC's stream-interruption retry path can append a user turn with
+    // content:[] as the final message. #1033 leaves an empty final user turn in
+    // place on the GENERAL path so a malformed third-party client gets an honest
+    // upstream error rather than a mangled conversation. But on a genuine CC
+    // session that empty turn is CC's OWN retry artifact, and "let upstream name
+    // it" is the #1066 session-killer: it sticks in history and every later
+    // request dies with "messages.N: user messages must have non-empty content".
+    // The retry's intent is to regenerate the response whose stream was cut, so
+    // rewind to it — drop the empty user turn and the assistant turn it
+    // interrupted, landing the request back on the last real user turn for a
+    // clean regeneration.
+    //
+    // Bounded and distinct from the #37 runaway loop: that popped a NON-empty
+    // trailing assistant with no empty user after it; this fires ONLY on a
+    // trailing EMPTY user turn and pops at most the one pair. Mid-conversation
+    // empties are already gone above, so a trailing empty user is the only shape
+    // that can reach here, and the assistant behind it is real.
+    {
+      const last = messages.length > 0 ? messages[messages.length - 1] : undefined;
+      if (last && last.role === 'user' && Array.isArray(last.content) && last.content.length === 0) {
+        messages.pop();
+        const prev = messages[messages.length - 1];
+        if (prev && prev.role === 'assistant') messages.pop();
+      }
+    }
+    const clientSystem = clientBody.system as Array<Record<string, unknown>>;
+    const system = clientSystem.map((b, i) => {
+      const copy = { ...b };
+      delete copy.cache_control;
+      if (i === 0) copy.text = billingTag;
+      return copy;
+    });
+    // Mirror CC's own placement: the identity + prompt blocks carry the
+    // stamps (the last two non-billing blocks; a 2-block system stamps just
+    // the last one).
+    for (let i = Math.max(1, system.length - 2); i < system.length; i++) {
+      system[i] = { ...system[i], cache_control: cacheControl };
+    }
+    for (const msg of messages) {
+      if (Array.isArray(msg.content)) {
+        for (const block of msg.content as Array<Record<string, unknown>>) {
+          delete block.cache_control;
+        }
+      }
+    }
+    const body: Record<string, unknown> = { ...clientBody, system };
+    body.metadata = {
+      user_id: JSON.stringify({
+        device_id: identity.deviceId,
+        account_uuid: identity.accountUuid,
+        session_id: identity.sessionId,
+      }),
+    };
+    return { body, toolMap: new Map<string, ToolMapping>(), unmappedTools: [], genuineCC: true };
+  }
+
+  // ── Detect text-tool-protocol clients up-front ──
+  // Cline / Kilo Code / Roo Code (and forks) ship an XML tool-invocation
+  // protocol in the system prompt. Peek at it before scrubbing so the
+  // brand name is still present, decide whether to auto-switch into
+  // preserve-tools behavior below. Explicit --hybrid-tools / --merge-tools
+  // outrank the heuristic (operator opt-in wins). dario#40.
+  //
+  // `noAutoDetect` skips the detector entirely — operators who want the
+  // full CC fingerprint restored (tools array included) even when their
+  // client is Cline/Kilo/Roo can opt out. They keep explicit control via
+  // --preserve-tools per session. dario#40 (ringge's fingerprint concern).
+  const rawSystemForDetection = extractSystemText(clientBody);
+  const detectedClient = opts.noAutoDetect
+    ? undefined
+    : (detectTextToolClient(rawSystemForDetection)
+       ?? detectNonCCByTools(clientTools)
+       ?? undefined);
+  const autoPreserve = Boolean(detectedClient) && !opts.hybridTools && !opts.mergeTools;
+  const effectivePreserveTools = Boolean(opts.preserveTools) || autoPreserve;
+  // Merge mode is the third tool-routing axis. Wire shape: CC's canonical
+  // tool array is sent first (so the fingerprint axis "tools[]" still
+  // matches CC's wire footprint), and the client's tools are appended
+  // after — deduped by name, case-insensitive. The model sees the union
+  // and may call either side; tool calls flow back unchanged because we
+  // skip the reverse-map (any rewriting would be lossy in both directions).
+  //
+  // Mutually exclusive with preserveTools and hybridTools — three flags
+  // would mean three different bodies; the operator must pick one. The
+  // proxy CLI enforces the mutex at startup, this just respects it.
+  const effectiveMergeTools = Boolean(opts.mergeTools) && !effectivePreserveTools && !opts.hybridTools;
+
+  // ── Strip thinking from history ──
+  for (const msg of messages) {
+    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      msg.content = (msg.content as Array<{ type: string }>).filter(b => b.type !== 'thinking');
+    }
+    // Strip cache_control from message blocks
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content as Array<Record<string, unknown>>) {
+        delete block.cache_control;
+      }
+    }
+  }
+
+  // (Empty text blocks and the mid-conversation empty-user-turn drop moved
+  // above the genuine-CC branch — dario#1077. Only the thinking strip stays
+  // path-local: genuine CC forwards its signed thinking verbatim.)
+
+  // ── Drop trailing empty turns ──
+  // An assistant turn that was thinking-only before the strip above becomes
+  // content: []. Forwarding that shape makes Anthropic interpret the request
+  // as a prefill ("continue from this assistant text"), which Opus 4.6 under
+  // adaptive thinking + the claude-code beta refuses with:
+  //   "This model does not support assistant message prefill. The
+  //    conversation must end with a user message."
+  // Drop ONLY empty trailing turns. Do not pop trailing assistant turns that
+  // still carry text or tool_use content — v3.10.1 popped any trailing
+  // assistant and that caused a runaway loop in OpenClaw (#37): the client
+  // appended its assistant reply locally, dario stripped it from the next
+  // request, the model regenerated the same reply, dario stripped that, and
+  // the loop never terminated (133 POSTs from a single user prompt).
+  //
+  // Restricted to ASSISTANT turns, which is the only shape this loop was
+  // written for (a thinking-only assistant turn emptied by the strip above).
+  // Popping an empty *user* turn is what the loop must not do: it exposes the
+  // assistant turn behind it and produces the very prefill rejection the loop
+  // exists to prevent (dario#1033). An empty user turn is a malformed client
+  // request either way — leaving it in place lets the upstream name it
+  // accurately ("messages.N: content must contain at least one block")
+  // instead of dario converting it into a misleading prefill error.
+  while (messages.length > 0) {
+    const last = messages[messages.length - 1];
+    const contentEmpty = Array.isArray(last.content) && (last.content as unknown[]).length === 0;
+    if (contentEmpty && last.role === 'assistant') {
+      messages.pop();
+      continue;
+    }
+    break;
+  }
+
+  // ── Build tool mapping ──
+  // In preserveTools mode, skip the tool name/arg rewriting entirely.
+  // Tool routing in real agents requires bidirectional schema fidelity that
+  // lossy forward-only translation can't provide. Users with custom tool
+  // schemas should use preserveTools to keep their tools as-is and accept
+  // the fingerprint risk on their own account.
+  const activeToolMap = new Map<string, ToolMapping>();
+  const unmappedTools: string[] = [];
+  // CC tools a declared client tool maps onto (identity or TOOL_MAP alias, not
+  // the round-robin fallback slots). Read by the advertise step below.
+  const claimedCC = new Set<string>();
+  // Client tools outside CC's set, under their MCP-shaped names, advertised
+  // after the MCP tools by the step below.
+  const mcpShapedTools: Array<Record<string, unknown>> = [];
+
+  if (clientTools && !effectivePreserveTools && !effectiveMergeTools) {
+    // Two passes so the unmapped-tool distributor can avoid colliding with
+    // CC tools the client already uses directly. Without this, a client
+    // sending both `WebSearch` and some unmapped tool like `memory_get`
+    // could have both forward-map to `WebSearch`, and the reverse map would
+    // then rewrite real `WebSearch` responses to the collided client name.
+    for (const tool of clientTools) {
+      const name = (tool.name as string || '').toLowerCase();
+      // A CC client's OWN tools map to THEMSELVES (identity), and this OVERRIDES
+      // TOOL_MAP. Two failure modes it fixes, both seen via the dock:
+      //  1. TOOL_MAP's lowercase cross-client aliases mistranslate a CC tool —
+      //     `Read` → TOOL_MAP['read'] whose translateBack emits {path, filePath}
+      //     instead of {file_path}, so every Read failed validation client-side.
+      //  2. CC's newer built-ins (Agent, AskUserQuestion, Cron*, Task*, Workflow,
+      //     NotebookEdit, Enter/ExitPlanMode, …) aren't in TOOL_MAP at all, so
+      //     they were round-robined onto Read/Bash/etc. and collided.
+      //  3. MCP tools (mcp__<server>__<tool>) carry operator-supplied schemas
+      //     that never have a TOOL_MAP or template entry. Real CC forwards them
+      //     verbatim, so they identity-map too and are advertised as-is below.
+      // Exact case is the discriminator (CC sends PascalCase; {path}-style clients
+      // send lowercase/snake) so a genuine non-CC `read` still routes via TOOL_MAP.
+      // Tracks the live bundle, so future CC tools are covered after the next bake.
+      // UNION set: identity must hold for a win32 client's PowerShell/Glob/Grep
+      // even when dario itself runs on Linux (v4.8.136) — the exact-case check
+      // still keeps a non-CC lowercase `glob`/`grep` on its TOOL_MAP alias.
+      const mapping = CC_NATIVE_NAMES_UNION.has(tool.name as string) || isMcpToolName(tool.name)
+        ? { ccTool: tool.name as string, translateArgs: (a: Record<string, unknown>) => a, translateBack: (a: Record<string, unknown>) => a }
+        : TOOL_MAP[name];
+      if (mapping) {
+        // In hybrid mode, clone the shared mapping and attach the
+        // client-declared top-level field names from input_schema.
+        // The reverse path uses these to inject request-context values
+        // into fields CC's schema doesn't carry.
+        if (opts.hybridTools) {
+          const schema = tool.input_schema as { properties?: Record<string, unknown> } | undefined;
+          const fields = schema?.properties ? Object.keys(schema.properties) : [];
+          activeToolMap.set(tool.name as string, { ...mapping, clientFields: fields });
+        } else {
+          activeToolMap.set(tool.name as string, mapping);
+        }
+        claimedCC.add(mapping.ccTool);
+      }
+    }
+
+    // Unmapped-tool handling differs by mode:
+    //
+    // - Default mode: round-robin to CC fallback tools. The model sees the CC
+    //   tool set, any tool call is "something", and we best-effort relay it
+    //   back to the client tool name. Broken-by-design for clients with rich
+    //   discriminator tools (OpenClaw lobster/memory_get, dario#36), but
+    //   preserves the old behavior for simple clients that don't have many
+    //   unmapped tools.
+    //
+    // - Hybrid mode: DROP unmapped tools entirely. We can't forward them to
+    //   the upstream (adding to CC_TOOL_DEFINITIONS breaks the fingerprint),
+    //   and round-robin mapping produces nonsense shapes on the reverse path
+    //   (lobster.translateBack(Glob.input) → {pattern: "..."} when lobster
+    //   wants {action: "run"}). Better to let the model not see those tools
+    //   than to pretend they exist and corrupt every call. Users needing
+    //   every client tool to actually work must use --preserve-tools.
+    //
+    // - A declaration that names a CC tool: the advertise step sends only the
+    //   CC tools the client declared, so a fallback slot is never on the wire
+    //   and a round-robined tool would be invisible to the model. Each
+    //   unmapped tool goes out instead the way real CC sends a tool beyond its
+    //   built-ins: the client's own definition under an `mcp__<server>__<tool>`
+    //   name, arguments untouched, renamed back on the response. A tool that
+    //   cannot be carried that way fails the request with its name.
+    const CC_FALLBACK_TOOLS = ['Bash', 'Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch'];
+    const namesCCTool = clientTools.some((t) =>
+      typeof t.name === 'string' && !isMcpToolName(t.name) && CC_TOOL_NAMES_LOWER.has(t.name.toLowerCase()));
+    const declaredNames = new Set(clientTools.map((t) => t.name));
+    const uncarried: Array<{ name: string; reason: string }> = [];
+    for (const tool of clientTools) {
+      const name = (tool.name as string || '').toLowerCase();
+      if (CC_NATIVE_NAMES_UNION.has(tool.name as string) || isMcpToolName(tool.name) || TOOL_MAP[name]) continue; // CC-native (union) / MCP (identity in pass 1) or mapped
+      unmappedTools.push(tool.name as string);
+      if (opts.hybridTools) continue; // dropped — see comment above
+      if (namesCCTool) {
+        const clientName = typeof tool.name === 'string' ? tool.name : '';
+        const wireName = `${CLIENT_TOOL_MCP_PREFIX}${clientName}`;
+        const toolType = (tool as { type?: unknown }).type;
+        if (!clientName) {
+          uncarried.push({ name: String(tool.name ?? ''), reason: 'no name' });
+        } else if ((toolType !== undefined && toolType !== 'custom') || !isAdvertisableToolDefinition(tool)) {
+          uncarried.push({ name: clientName, reason: 'not a custom tool with an input_schema' });
+        } else if (!TOOL_NAME_PATTERN.test(wireName)) {
+          uncarried.push({ name: clientName, reason: `${wireName} is not a valid tool name of at most 64 characters` });
+        } else if (declaredNames.has(wireName)) {
+          uncarried.push({ name: clientName, reason: `the client also declares ${wireName}` });
+        } else {
+          activeToolMap.set(clientName, { ccTool: wireName, translateArgs: (a) => a, translateBack: (a) => a });
+          mcpShapedTools.push({ ...tool, name: wireName });
+        }
+        continue;
+      }
+      // Default mode: round-robin distribution. Exclude CC tools the client
+      // already uses so we never create a two-client-names-to-one-CC-tool
+      // collision. If every fallback is claimed (rare: client already uses 6+
+      // CC tools), fall back to the full pool and accept the ambiguity.
+      const pool = CC_FALLBACK_TOOLS.filter(t => !claimedCC.has(t));
+      const fallbackPool = pool.length > 0 ? pool : CC_FALLBACK_TOOLS;
+      const fallbackTool = fallbackPool[(unmappedTools.length - 1) % fallbackPool.length];
+      activeToolMap.set(tool.name as string, {
+        ccTool: fallbackTool,
+        translateArgs: (a) => {
+          switch (fallbackTool) {
+            case 'Bash': return { command: `echo "${JSON.stringify(a).slice(0, 200)}"` };
+            case 'Read': return { file_path: String(a.path || a.file || a.url || '/tmp/output') };
+            case 'Grep': return { pattern: String(a.query || a.pattern || a.search || '.'), path: '.' };
+            case 'Glob': return { pattern: String(a.pattern || a.glob || '*') };
+            case 'WebSearch': return { query: String(a.query || a.q || a.search || '') };
+            case 'WebFetch': return { url: String(a.url || a.uri || '') };
+            default: return a;
+          }
+        },
+        // Unmapped-fallback mappings must always lose the reverse-lookup
+        // collision to any legitimate mapping that targets the same CC tool.
+        // Otherwise a client that declares both an unmapped tool (e.g.
+        // OpenClaw's `image`) round-robin'd onto Glob AND a real `glob` /
+        // `find_files` / `list_files` mapping can have the reverse path
+        // route real Glob tool_use blocks back to `image`, which then fails
+        // its own input validation ("image required"). dario#37, Glob half.
+        reverseScore: 0,
+      });
+    }
+    if (uncarried.length > 0) throw new UnsupportedClientToolError(uncarried);
+  }
+
+  // ── Remap tool_use and tool_result references in message history ──
+  // Skip in preserveTools mode — leave conversation history untouched.
+  if (!effectivePreserveTools) {
+    for (const msg of messages) {
+      if (Array.isArray(msg.content)) {
+        for (const block of msg.content as Array<Record<string, unknown>>) {
+          if (block.type === 'tool_use' && typeof block.name === 'string') {
+            const mapping = activeToolMap.get(block.name);
+            if (mapping) {
+              block.name = mapping.ccTool;
+              if (mapping.translateArgs && block.input) {
+                block.input = mapping.translateArgs(block.input as Record<string, unknown>);
+              }
+            }
+          }
+          // Strip any client-specific fields from tool_result blocks that CC wouldn't send
+          if (block.type === 'tool_result') {
+            // Remove non-standard fields clients may add
+            for (const key of Object.keys(block)) {
+              if (!['type', 'tool_use_id', 'content', 'is_error'].includes(key)) {
+                delete block[key];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ── Compact conversation history ──
+  // Real CC conversations have specific patterns. Strip metadata that
+  // third-party frameworks inject into tool_result content.
+  for (const msg of messages) {
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content as Array<Record<string, unknown>>) {
+        // Truncate very long tool_result content — CC tool results are typically
+        // shorter because CC truncates file reads, command output, etc.
+        if (block.type === 'tool_result' && typeof block.content === 'string' && block.content.length > 30000) {
+          block.content = block.content.slice(0, 30000) + '\n[...truncated]';
+        }
+        // Also handle array-form tool_result content
+        if (block.type === 'tool_result' && Array.isArray(block.content)) {
+          for (const sub of block.content as Array<Record<string, unknown>>) {
+            if (sub.type === 'text' && typeof sub.text === 'string' && sub.text.length > 30000) {
+              sub.text = sub.text.slice(0, 30000) + '\n[...truncated]';
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ── Merge system prompt ──
+  // rawSystemForDetection holds the same text already used by the
+  // up-front detector above — reuse it here so we don't reparse the
+  // system array a second time per request. Scrub applies at this
+  // point so framework identifiers don't leak upstream.
+  let systemText = scrubFrameworkIdentifiers(rawSystemForDetection);
+
+  // Also scrub framework identifiers from message content text blocks —
+  // clients can leak their product name in user/tool messages too. This uses
+  // the CONTENT-SAFE subset (scrubFrameworkIdentifiersInContent), NOT the full
+  // pattern set: message content is the user's own code/data and must never be
+  // mutated. The full set ran here previously and corrupted source — the JS
+  // keyword `continue;` became `;` (Continue.dev is a scrubbed name), so a code
+  // auditor "found" a bare-semicolon no-op the proxy itself had introduced.
+  for (const msg of messages) {
+    if (typeof msg.content === 'string') {
+      msg.content = scrubFrameworkIdentifiersInContent(msg.content as string);
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content as Array<Record<string, unknown>>) {
+        if (block.type === 'text' && typeof block.text === 'string') {
+          block.text = scrubFrameworkIdentifiersInContent(block.text);
+        }
+        if (block.type === 'tool_result' && typeof block.content === 'string') {
+          block.content = scrubFrameworkIdentifiersInContent(block.content);
+        }
+        if (block.type === 'tool_result' && Array.isArray(block.content)) {
+          for (const sub of block.content as Array<Record<string, unknown>>) {
+            if (sub.type === 'text' && typeof sub.text === 'string') {
+              sub.text = scrubFrameworkIdentifiersInContent(sub.text);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ── Build the CC request from template ──
+  // Key order matches CC v2.1.104 exactly:
+  // model, messages, system, tools, metadata, max_tokens, thinking, context_management, output_config, stream
+  //
+  // System prompt structure (3 blocks, matching real CC):
+  //   [0] billing tag (no cache)
+  //   [1] agent identity (ephemeral cache)
+  //   [2] CC's full 25KB system prompt + client's custom prompt appended (ephemeral cache)
+  // resolveSystemPrompt is the seam for --system-prompt=verbatim|partial|
+  // aggressive|<file>. Default (undefined) returns CC_SYSTEM_PROMPT
+  // unchanged. See docs/research/system-prompt-classifier-study.md for the empirical
+  // validation that this slot is unfingerprinted by the billing classifier.
+  const baseSystemPrompt = resolveSystemPrompt(opts.systemPrompt, model);
+  const fullSystemPrompt = systemText
+    ? `${baseSystemPrompt}${CLIENT_SYSTEM_PREFACE}${systemText}`
+    : baseSystemPrompt;
+
+  const ccRequest: Record<string, unknown> = {
+    model,
+    messages,
+    system: [
+      { type: 'text', text: billingTag },
+      { type: 'text', text: CC_AGENT_IDENTITY, cache_control: cacheControl },
+      { type: 'text', text: fullSystemPrompt, cache_control: cacheControl },
+    ],
+  };
+
+  // Tools come before metadata in CC's key order.
+  // - preserveTools mode: pass client tools through unchanged (better for
+  //   real agents with custom schemas, but loses the CC tool fingerprint).
+  // - mergeTools mode: send CC's canonical tools FIRST then append the
+  //   client's tools, deduped by name (case-insensitive). The model sees
+  //   the union; tool calls flow back unchanged because activeToolMap is
+  //   empty in this branch. Trade-off documented in the README: the
+  //   wire-shape "tools[]" axis still contains CC's array as a prefix,
+  //   but the suffix is operator-supplied custom shapes — Anthropic's
+  //   classifier may flip routing on the difference. Verify locally
+  //   before relying on it.
+  if (clientTools && clientTools.length > 0) {
+    if (effectivePreserveTools) {
+      ccRequest.tools = clientTools;
+    } else if (effectiveMergeTools) {
+      const ccNames = new Set(
+        (CC_TOOL_DEFINITIONS as Array<{ name: string }>).map((t) => t.name.toLowerCase()),
+      );
+      const appended = clientTools.filter((t) => {
+        const name = (t.name as string | undefined)?.toLowerCase();
+        return name !== undefined && !ccNames.has(name);
+      });
+      ccRequest.tools = [...CC_TOOL_DEFINITIONS, ...appended];
+    } else {
+      // Advertise only the CC-native tools the client actually declared.
+      // Substituting the FULL CC template here makes the model emit a tool_use
+      // for a tool the client never sent — e.g. AskUserQuestion when a headless
+      // or SDK session has it disabled — and the client harness then rejects it
+      // with "<Tool> exists but is not enabled in this context" (reported via a
+      // dario-routed CC session). A real CC client with a reduced tool set sends
+      // exactly this reduced array (every --disallowedTools / MCP delta does
+      // this), so filtering tracks CC's wire shape rather than diverging from it.
+      //
+      // MCP tools (mcp__<server>__<tool>) are appended VERBATIM after the
+      // canonical natives — that mirrors real CC, which sends operator-supplied
+      // MCP schemas after its built-ins. There is no template entry to
+      // substitute, and omitting them here (pre-v4.8.135) meant the model never
+      // saw the session's MCP surface at all while history references were
+      // round-robined onto fallback slots.
+      //
+      // If the client declared neither a CC-native nor an MCP tool it isn't
+      // really CC; keep the full template as the safer fingerprint default in
+      // that case. An mcp-only declaration goes out verbatim instead — falling
+      // back to the full template there would advertise natives the client
+      // can't execute (the AskUserQuestion failure mode above).
+      const clientToolNames = new Set(
+        clientTools
+          .map((t) => (t.name as string | undefined)?.toLowerCase())
+          .filter((n): n is string => Boolean(n)),
+      );
+      // Intersect against the UNION, not the host-filtered set: the client's
+      // declaration encodes the client's platform, so a win32 CC declaring
+      // PowerShell/Glob/Grep gets their canonical defs even from a Linux-hosted
+      // dario. The host filter only governs the no-declaration fallbacks.
+      //
+      // mcp__* entries are EXCLUDED from the template side: a live capture on
+      // a machine with MCP servers configured absorbs the capture session's
+      // mcp__* tools into the template (the dario#678 reporter's doctor showed
+      // 138 tool defs — ~111 of them MCP pollution), and any client-declared
+      // MCP tool whose name also sat in the polluted union then went out
+      // TWICE (template def + verbatim client schema) — upstream rejects the
+      // whole request with 400 "tools: Tool names must be unique". MCP
+      // schemas are operator-supplied; the client's declaration is the only
+      // authoritative source, never the template.
+      const namedCC = (CC_TOOL_DEFINITIONS_UNION as Array<{ name: string }>).filter((t) =>
+        !isMcpToolName(t.name) && clientToolNames.has(t.name.toLowerCase()),
+      );
+      // Once the declaration names any CC tool, every alias also declares the
+      // CC tool it maps onto (`read_file` declares Read): advertising only the
+      // name matches would leave the model unable to call the other mapped
+      // tools. A declaration that names no CC tool keeps the full template.
+      const availableCC = namedCC.length > 0
+        ? (CC_TOOL_DEFINITIONS_UNION as Array<{ name: string }>).filter((t) =>
+          !isMcpToolName(t.name) && (clientToolNames.has(t.name.toLowerCase()) || claimedCC.has(t.name)))
+        : namedCC;
+      const mcpTools = clientTools.filter((t) => isMcpToolName(t.name));
+      // A CC-native name the bundle knows but cannot advertise (dario#1376:
+      // `advisor` captured with an empty schema) is still identity-mapped
+      // above; the only usable definition is the client's own, so it goes out
+      // verbatim, as MCP tools do. The client's schema is what its parser
+      // expects back in any case.
+      const clientOwnNative = clientTools.filter((t) =>
+        typeof t.name === 'string' && CC_TOOL_DEFINITIONS_UNADVERTISABLE.has(t.name) && isAdvertisableToolDefinition(t),
+      );
+      // Client tools outside CC's set follow the MCP tools, under the
+      // MCP-shaped names the tool map gave them.
+      ccRequest.tools = availableCC.length > 0 || mcpTools.length > 0 || clientOwnNative.length > 0 || mcpShapedTools.length > 0
+        ? dedupeToolsByName([...availableCC, ...clientOwnNative, ...mcpTools, ...mcpShapedTools])
+        : CC_TOOL_DEFINITIONS;
+    }
+  } else if (effectiveMergeTools) {
+    // Operator opted into merge but the client sent no tools. Still
+    // emit the CC base array — that preserves the fingerprint shape
+    // (zero-tools requests are themselves a divergence from CC's
+    // wire footprint).
+    ccRequest.tools = CC_TOOL_DEFINITIONS;
+  } else if (model.toLowerCase().includes('fable')) {
+    // Fable refuses tool-less CC-shaped MULTI-TURN requests (live replay
+    // bisect 2026-06-09): scrubbed system + zero tools + an assistant turn
+    // in history → 200 + stop_reason "refusal" with empty content on every
+    // request, while the byte-identical body WITH CC's tool array answers.
+    // Real CC always sends its tool array, so zero-tools is itself a
+    // fingerprint divergence (see the merge-tools note above) — fable's
+    // refusal layer is just the first model to punish it. Emit the CC base
+    // array pinned with `tool_choice: none` so the model cannot call tools
+    // the client never declared (without the pin it DOES — verified
+    // spurious WebFetch on a weather prompt). Other families keep the
+    // legacy tool-less shape, which they demonstrably accept.
+    ccRequest.tools = CC_TOOL_DEFINITIONS;
+    ccRequest.tool_choice = { type: 'none' };
+  }
+
+  // Preserve a valid client tool_choice after tool-name translation.
+  if (clientTools && clientTools.length > 0) {
+    const passed = passthroughToolChoice(clientBody.tool_choice, ccRequest.tools as Array<{ name?: unknown }> | undefined, activeToolMap);
+    if (passed) ccRequest.tool_choice = passed;
+  }
+
+  // Metadata
+  ccRequest.metadata = {
+    user_id: JSON.stringify({
+      device_id: identity.deviceId,
+      account_uuid: identity.accountUuid,
+      session_id: identity.sessionId,
+    }),
+  };
+
+  ccRequest.max_tokens = resolveMaxTokens(opts.maxTokens, clientBody);
+
+  // Model-specific fields — order: thinking, context_management, output_config
+  //
+  // Layered guard:
+  //
+  //  1. Haiku skips all three by construction (existing behavior).
+  //
+  //  2. `thinking: {type:"adaptive"}` is a 4.6-generation feature; older
+  //     Opus/Sonnet 4-5 models 400 it (`"adaptive thinking is not supported
+  //     on this model"`). `context_management.edits[clear_thinking_*]` is
+  //     tied to thinking — sending it without an enabled thinking field
+  //     400s too (`"clear_thinking_* strategy requires thinking to be
+  //     enabled or adaptive"`). Both are gated on `supportsAdaptiveThinking`;
+  //     either both ship or neither does.
+  //
+  //  3. Each remaining injection is also opt-out via `opts.skipFields`.
+  //     Non-CC clients (e.g. apps calling dario via the Anthropic SDK)
+  //     sometimes hit model endpoints that still 400 on these fields with
+  //     "Extra inputs are not permitted" even when supportsAdaptiveThinking
+  //     is true. Operators set `--skip-fields=context_management,…` (or
+  //     DARIO_SKIP_FIELDS=…) to suppress the offending field while keeping
+  //     all other CC fingerprinting (headers, beta flags, metadata) intact
+  //     — Max billing pool routing is unchanged.
+  //
+  // `output_config.effort` is independent of thinking and ships for all
+  // non-Haiku models that aren't opted out via skipFields. Default: forward
+  // the client's own effort (it's a user knob — real CC wires whatever the
+  // user tuned), falling back to 'high' when the client sent none; `--effort`
+  // flag pins an operator override. See resolveEffort / dario#87.
+  if (!isHaiku) {
+    const skip = opts.skipFields;
+    // Client-supplied thinking shape takes precedence when honorClientThinking
+    // is enabled. SDK clients (vs CC) sometimes need explicit control over
+    // budget_tokens or the type='enabled' vs type='adaptive' choice — e.g.
+    // an agent that wants 8k thinking tokens for hard problems, or a model
+    // that supports thinking but not the 4.6-era adaptive variant. dario's
+    // default builds the CC-style adaptive shape, which is fine for CC
+    // clients but doesn't expose the budget knob to others.
+    //
+    // When honored, we also suppress dario's clear_thinking_* context-edit
+    // pair — that edit is tuned for type='adaptive' and the client's shape
+    // takes responsibility for the request as a whole. Effort still ships.
+    const clientThinking = (clientBody.thinking ?? null) as Record<string, unknown> | null;
+    const honoredClientThinking = Boolean(
+      opts.honorClientThinking
+      && clientThinking
+      && typeof clientThinking === 'object'
+      && typeof clientThinking['type'] === 'string',
+    );
+    if (honoredClientThinking) {
+      if (!skip || !skip.has('thinking')) {
+        ccRequest.thinking = clientThinking;
+      }
+      // Intentionally do NOT inject context_management.clear_thinking_*
+      // when honoring client thinking — the pairing is shape-specific.
+    } else if (supportsAdaptiveThinking(model)) {
+      if (!skip || !skip.has('thinking')) {
+        // CC 2.1.198 sends `display: "omitted"` alongside the adaptive type on
+        // every adaptive-thinking model (verified via capture-full-body.mjs on
+        // fable-5 + opus-4-8, 2026-07-01). Match it so the wire shape stays
+        // byte-aligned with CC.
+        ccRequest.thinking = { type: 'adaptive', display: 'omitted' };
+      }
+      if (!skip || !skip.has('context_management')) {
+        ccRequest.context_management = { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] };
+      }
+    }
+    if (!skip || !skip.has('output_config')) {
+      ccRequest.output_config = { effort: resolveEffort(opts.effort, clientBody, model) };
+    }
+  }
+
+  // --preserve-output-format: carry the client's `output_config.format`
+  // (Anthropic's native structured-output JSON schema) through to upstream.
+  // dario rebuilds output_config from the CC template (effort only), so a
+  // structured-output client's schema is otherwise dropped and the model
+  // free-runs into prose its strict parser rejects. Unlike the injected
+  // thinking/effort above (gated on !isHaiku because haiku rejects them),
+  // this is the caller's OWN directive — it rides on whatever model the
+  // caller chose, and is independent of skipFields, which opts out dario's
+  // injected fields, not the caller's schema constraint.
+  if (opts.preserveOutputFormat) {
+    const clientOutputConfig = clientBody.output_config as { format?: unknown } | undefined;
+    if (clientOutputConfig?.format !== undefined) {
+      const existing = (ccRequest.output_config as Record<string, unknown> | undefined) ?? {};
+      ccRequest.output_config = { ...existing, format: clientOutputConfig.format };
+    }
+  }
+
+  ccRequest.stream = stream;
+
+  // Replay the captured top-level key order. The hardcoded build order above
+  // matches CC v2.1.104 and is kept as a deterministic fallback; when a live
+  // (or baked post-v3.22) template has body_field_order, the helper reorders
+  // to match that. Future CC releases that reshuffle or add a field are then
+  // picked up by the next live refresh without a dario release.
+  const orderedBody = orderBodyForOutbound(ccRequest);
+
+  // Client names of the unmapped tools that went out MCP-shaped (the rest of
+  // unmappedTools rode fallback slots or, in hybrid mode, were dropped).
+  const carriedAsMcp = unmappedTools.filter((n) => activeToolMap.get(n)?.ccTool === `${CLIENT_TOOL_MCP_PREFIX}${n}`);
+  return { body: orderedBody, toolMap: activeToolMap, unmappedTools, carriedAsMcp, detectedClient };
+}
+
+/**
+ * Build the CC-name → {clientName, mapping} reverse lookup used by both
+ * the non-streaming and streaming reverse-mappers.
+ *
+ * Two-pass construction preserves the original identity-protection rule:
+ * when a client sent a tool with the literal CC name (e.g. `WebSearch`),
+ * that pairing claims the CC slot first so a later unmapped-tool fallback
+ * that also lands on `WebSearch` can't overwrite it.
+ *
+ * Within the non-identity pass, collisions are broken by `reverseScore`
+ * (higher wins, default 10). This matters when a client declares two
+ * tools that both map to the same CC tool — OpenClaw declares both
+ * `exec` (bash-like, score 10) and `process` (action-discriminator,
+ * score 1) and both map to Bash. Pre-fix, insertion-order last-wins
+ * routed Bash tool calls through `process`, which interpreted the
+ * command string as an action and returned "Unknown action" for
+ * every call. `process` now has reverseScore: 1 so bash/exec wins
+ * (dario#37).
+ */
+function buildReverseLookup(toolMap: Map<string, ToolMapping>): Map<string, { clientName: string; mapping: ToolMapping }> {
+  const reverseMap = new Map<string, { clientName: string; mapping: ToolMapping }>();
+  const identityClaimed = new Set<string>();
+  for (const [clientName, mapping] of toolMap) {
+    if (clientName.toLowerCase() === mapping.ccTool.toLowerCase()) {
+      identityClaimed.add(mapping.ccTool);
+      reverseMap.set(mapping.ccTool, { clientName, mapping });
+    }
+  }
+  // Score-based collision resolution in the non-identity pass.
+  // reverseScore: 0 means "never claim a reverse slot at all" — used for
+  // unmapped-fallback mappings whose forward path exists for round-robin
+  // distribution but whose reverse path would corrupt real CC tool calls
+  // (e.g. routing a real Glob tool_use back to an unmapped `image` client
+  // tool with the wrong input shape, dario#37 Glob half).
+  const scoreOf = (m: ToolMapping): number => m.reverseScore ?? 10;
+  for (const [clientName, mapping] of toolMap) {
+    if (clientName.toLowerCase() === mapping.ccTool.toLowerCase()) continue;
+    if (identityClaimed.has(mapping.ccTool)) continue;
+    if (scoreOf(mapping) === 0) continue;
+    const existing = reverseMap.get(mapping.ccTool);
+    if (!existing || scoreOf(mapping) > scoreOf(existing.mapping)) {
+      reverseMap.set(mapping.ccTool, { clientName, mapping });
+    }
+  }
+  return reverseMap;
+}
+
+/**
+ * Apply the reverse mapping to a single tool_use block in place.
+ * Mutates `block.name` (CC name → client name) and `block.input`
+ * (CC parameter shape → client parameter shape) when the mapping
+ * has a `translateBack`. Identity mappings and mappings with no
+ * `translateBack` defined leave the input unchanged.
+ *
+ * Issue #29 fix lives here: previously only the name was rewritten,
+ * leaving the input shape in CC's parameter names which the client's
+ * own validator would reject.
+ */
+function rewriteToolUseBlock(
+  block: Record<string, unknown>,
+  reverseMap: Map<string, { clientName: string; mapping: ToolMapping }>,
+  ctx?: RequestContext,
+): void {
+  const ccName = block.name;
+  if (typeof ccName !== 'string') return;
+  const entry = reverseMap.get(ccName);
+  if (!entry) return;
+
+  block.name = entry.clientName;
+  if (entry.mapping.translateBack && block.input && typeof block.input === 'object') {
+    try {
+      block.input = entry.mapping.translateBack(block.input as Record<string, unknown>);
+    } catch {
+      // If the translateBack throws on unexpected shape, leave input
+      // alone rather than crashing the response. The client will see
+      // the same broken input it would have seen pre-v3.7.0.
+    }
+  }
+  // Hybrid mode: inject request-context values into any client-declared
+  // fields still missing after translateBack. No-op unless the mapping
+  // was built with `clientFields` populated (hybridTools: true) and a
+  // context was passed in.
+  if (entry.mapping.clientFields && block.input && typeof block.input === 'object') {
+    injectContextFields(block.input as Record<string, unknown>, entry.mapping.clientFields, ctx);
+  }
+}
+
+/**
+ * Reverse-map CC tool calls in a non-streaming response back to the
+ * client's original tool names AND parameter shapes. Walks the parsed
+ * JSON `content` array and rewrites every `tool_use` block. If the
+ * body isn't valid JSON (e.g. an error response, a partial chunk),
+ * returns it unchanged.
+ */
+export function reverseMapResponse(
+  responseBody: string,
+  toolMap: Map<string, ToolMapping>,
+  ctx?: RequestContext,
+): string {
+  if (toolMap.size === 0) return responseBody;
+
+  const reverseMap = buildReverseLookup(toolMap);
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(responseBody) as Record<string, unknown>;
+  } catch {
+    return responseBody;
+  }
+
+  const content = parsed.content;
+  if (!Array.isArray(content)) return responseBody;
+
+  for (const block of content) {
+    if (block && typeof block === 'object' && (block as Record<string, unknown>).type === 'tool_use') {
+      rewriteToolUseBlock(block as Record<string, unknown>, reverseMap, ctx);
+    }
+  }
+
+  return JSON.stringify(parsed);
+}
+
+/**
+ * Streaming reverse-mapper for SSE responses.
+ *
+ * The non-streaming reverse-map can rewrite tool_use input in one pass
+ * because it sees the whole `input` object. SSE streaming arrives in
+ * three phases per tool_use block:
+ *
+ *   content_block_start  → carries `tool_use.name` and `tool_use.input: {}`
+ *   content_block_delta  → carries `input_json_delta.partial_json` chunks
+ *                          that, concatenated, form the full input JSON
+ *   content_block_stop   → end of the block
+ *
+ * To rewrite the parameter shape we need the FULL input, which only
+ * exists at content_block_stop. So for tool_use blocks that need
+ * translation, we:
+ *
+ *   1. Forward content_block_start with the rewritten name (so clients
+ *      see their own tool name immediately and can start tracking it)
+ *   2. Swallow content_block_delta events for that block, accumulating
+ *      partial_json into a per-block buffer
+ *   3. On content_block_stop, parse the accumulated input, apply
+ *      translateBack, and emit ONE synthetic content_block_delta with
+ *      the full translated input as a single partial_json string,
+ *      followed by the original content_block_stop event
+ *
+ * Trade-off: clients that consume tool_use input as it streams (rare
+ * but possible) will see the input arrive as a single chunk at the
+ * end of the block instead of streaming character-by-character. For
+ * tool_use that's acceptable — input is usually small (<1KB) and the
+ * alternative is parameter-shape mismatch causing validation errors.
+ *
+ * For tool_use blocks that DON'T have a translateBack mapping (or
+ * aren't in the reverseMap at all), the streaming mapper passes the
+ * original SSE bytes through unchanged.
+ *
+ * Usage:
+ *
+ *   const mapper = createStreamingReverseMapper(toolMap);
+ *   for await (const chunk of upstream) res.write(mapper.feed(chunk));
+ *   const tail = mapper.end();
+ *   if (tail.length) res.write(tail);
+ */
+export interface StreamingReverseMapper {
+  feed(chunk: Uint8Array): Uint8Array;
+  end(): Uint8Array;
+}
+
+interface BufferedToolBlock {
+  /** Original CC tool name from content_block_start. */
+  ccName: string;
+  /** Mapping from the reverse lookup, including translateBack. */
+  mapping: ToolMapping;
+  /** Client tool name to emit. */
+  clientName: string;
+  /** Concatenated partial_json fragments. */
+  partial: string;
+}
+
+/**
+ * Cap on how large we'll let a single tool_use block's `partial_json`
+ * accumulation grow before abandoning translation for that block and
+ * falling back to passthrough. Two megabytes accommodates the largest
+ * real tool inputs we've observed (Edit/Write with multi-file payloads)
+ * with headroom; beyond this the upstream is almost certainly malformed
+ * or adversarial and not worth buffering further. Unbounded growth was
+ * the hole — streaming runs in-process so a runaway input_json_delta
+ * would starve whatever else the proxy is serving.
+ */
+const MAX_TOOL_PARTIAL_BYTES = 2_000_000;
+
+export function createStreamingReverseMapper(
+  toolMap: Map<string, ToolMapping>,
+  ctx?: RequestContext,
+): StreamingReverseMapper {
+  const noop: StreamingReverseMapper = {
+    feed: (chunk) => chunk,
+    end: () => new Uint8Array(0),
+  };
+  if (toolMap.size === 0) return noop;
+
+  const reverseMap = buildReverseLookup(toolMap);
+  // If no mapping needs translation OR context injection, fall back to
+  // identity behavior so we don't pay the SSE-parsing cost on every chunk.
+  // Hybrid mode with clientFields always needs the streaming path so the
+  // injection can run at content_block_stop.
+  let anyNeedsTranslation = false;
+  for (const { mapping } of reverseMap.values()) {
+    if (mapping.translateBack || (mapping.clientFields && mapping.clientFields.length > 0)) {
+      anyNeedsTranslation = true;
+      break;
+    }
+  }
+  if (!anyNeedsTranslation) return noop;
+
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  // We process on SSE event-group boundaries, not line boundaries.
+  // Events are separated by a blank line (two consecutive newlines);
+  // within an event group there may be multiple header lines like
+  // `event: content_block_delta` and `data: {...}`. The old code
+  // processed one line at a time, which meant swallowed deltas left
+  // orphan `event:` lines and synthetic delta+stop emissions joined
+  // two `data:` lines without a blank-line separator — which SSE
+  // parsers concatenate into one malformed multi-line event that
+  // fails JSON.parse downstream. v3.7.1 fixes both by processing
+  // whole event groups.
+  let groupBuffer = '';
+  // index → BufferedToolBlock for tool_use content blocks currently
+  // being held for end-of-block translation.
+  const buffered = new Map<number, BufferedToolBlock>();
+
+  /**
+   * Build a complete SSE event group string with an `event:` header
+   * and a `data:` line. Used when emitting rewritten or synthetic
+   * events so the wire format matches what upstream produces.
+   */
+  function buildEvent(type: string, payload: unknown): string {
+    return `event: ${type}\ndata: ${JSON.stringify(payload)}`;
+  }
+
+  /**
+   * Process one complete SSE event group. Returns:
+   *   - a string with one or more rewritten event groups separated
+   *     by "\n\n" (no trailing blank line — the caller adds that)
+   *   - null to drop the event group entirely (swallow)
+   *   - the original `eventText` to pass through unchanged
+   *
+   * An event group is the text between blank lines. It may contain
+   * lines like `event: <type>`, `data: <payload>`, `id:`, `retry:`
+   * in any order. We only look at the `data:` line (Anthropic never
+   * uses multi-line data payloads).
+   */
+  function processEventGroup(eventText: string): string | null {
+    if (eventText === '') return eventText;
+
+    // Find the data: line. Anthropic's SSE uses one data: per event.
+    const lines = eventText.split('\n');
+    let dataLineIdx = -1;
+    let dataText = '';
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      if (line.startsWith('data:')) {
+        dataLineIdx = i;
+        dataText = line.slice(5).trim();
+        break;
+      }
+    }
+
+    if (dataLineIdx === -1 || dataText === '' || dataText === '[DONE]') {
+      return eventText;
+    }
+
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(dataText) as Record<string, unknown>;
+    } catch {
+      return eventText;
+    }
+
+    const type = event.type;
+
+    if (type === 'content_block_start') {
+      const idx = typeof event.index === 'number' ? event.index : -1;
+      const block = event.content_block as Record<string, unknown> | undefined;
+      if (block && block.type === 'tool_use' && typeof block.name === 'string') {
+        const entry = reverseMap.get(block.name);
+        const needsBuffering = entry && idx >= 0 && (
+          entry.mapping.translateBack ||
+          (entry.mapping.clientFields && entry.mapping.clientFields.length > 0)
+        );
+        if (entry && needsBuffering) {
+          // Stash the block so we can flush a translated version at
+          // content_block_stop. Emit a rewritten start event now so
+          // the client sees its own tool name immediately.
+          buffered.set(idx, {
+            ccName: block.name,
+            mapping: entry.mapping,
+            clientName: entry.clientName,
+            partial: '',
+          });
+          block.name = entry.clientName;
+          // Reset input to empty so the client doesn't see CC's empty
+          // placeholder before the translated full input arrives.
+          block.input = {};
+          return buildEvent('content_block_start', event);
+        }
+        // Tool we don't translate — just rewrite the name in place.
+        if (entry) {
+          block.name = entry.clientName;
+          return buildEvent('content_block_start', event);
+        }
+      }
+      return eventText;
+    }
+
+    if (type === 'content_block_delta') {
+      const idx = typeof event.index === 'number' ? event.index : -1;
+      const buf = idx >= 0 ? buffered.get(idx) : undefined;
+      if (!buf) return eventText;
+
+      const delta = event.delta as Record<string, unknown> | undefined;
+      if (delta && delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
+        // Cap per-block partial accumulation. If one more delta would
+        // blow the cap, flush what we have as a passthrough delta and
+        // drop the block from `buffered` — further deltas / the stop
+        // event fall through the "no buf" path and pass unchanged.
+        // The client loses translation for this one block, but avoids
+        // an unbounded in-memory string on a malformed upstream stream.
+        if (buf.partial.length + delta.partial_json.length > MAX_TOOL_PARTIAL_BYTES) {
+          const flushed = {
+            type: 'content_block_delta',
+            index: idx,
+            delta: { type: 'input_json_delta', partial_json: buf.partial + delta.partial_json },
+          };
+          buffered.delete(idx);
+          return buildEvent('content_block_delta', flushed);
+        }
+        buf.partial += delta.partial_json;
+        // Swallow the whole event group — including any `event:`
+        // header line the upstream emitted for it — because we'll
+        // emit a synthetic combined delta at content_block_stop.
+        return null;
+      }
+      return eventText;
+    }
+
+    if (type === 'content_block_stop') {
+      const idx = typeof event.index === 'number' ? event.index : -1;
+      const buf = idx >= 0 ? buffered.get(idx) : undefined;
+      if (!buf) return eventText;
+
+      let translatedInput: Record<string, unknown> = {};
+      let parseOk = true;
+      try {
+        const parsedInput = JSON.parse(buf.partial || '{}') as Record<string, unknown>;
+        translatedInput = buf.mapping.translateBack
+          ? buf.mapping.translateBack(parsedInput)
+          : parsedInput;
+        if (buf.mapping.clientFields && buf.mapping.clientFields.length > 0) {
+          injectContextFields(translatedInput, buf.mapping.clientFields, ctx);
+        }
+      } catch {
+        parseOk = false;
+      }
+
+      buffered.delete(idx);
+
+      if (!parseOk) {
+        // Fall back to passing the original partial through unchanged
+        // so the client at least sees whatever upstream actually sent.
+        // Emit as TWO separate SSE events with blank-line separators.
+        const passthroughDelta = {
+          type: 'content_block_delta',
+          index: idx,
+          delta: { type: 'input_json_delta', partial_json: buf.partial },
+        };
+        return (
+          buildEvent('content_block_delta', passthroughDelta) +
+          '\n\n' +
+          buildEvent('content_block_stop', event)
+        );
+      }
+
+      const synthDelta = {
+        type: 'content_block_delta',
+        index: idx,
+        delta: { type: 'input_json_delta', partial_json: JSON.stringify(translatedInput) },
+      };
+      // Emit as TWO separate SSE events joined by a blank line so
+      // downstream parsers see them as distinct events. The outer
+      // processBuffer will append one more "\n\n" after the final
+      // event in this group, which is correct SSE framing.
+      return (
+        buildEvent('content_block_delta', synthDelta) +
+        '\n\n' +
+        buildEvent('content_block_stop', event)
+      );
+    }
+
+    return eventText;
+  }
+
+  function processBuffer(flush: boolean): string {
+    // Split the accumulated buffer on "\n\n" (SSE event separator).
+    // Every complete part is a full event group; the last part is
+    // either empty (the trailing blank after a completed event) or
+    // a partial event that needs to wait for more bytes.
+    const parts = groupBuffer.split('\n\n');
+    if (!flush) {
+      // Hold the last (potentially incomplete) part back.
+      groupBuffer = parts.pop() ?? '';
+    } else {
+      groupBuffer = '';
+    }
+
+    const out: string[] = [];
+    for (const part of parts) {
+      if (part === '') continue;
+      const processed = processEventGroup(part);
+      if (processed !== null) out.push(processed);
+    }
+    // Each emitted event (or multi-event group) needs a trailing
+    // blank line so the SSE framing is correct. We join with "\n\n"
+    // and append "\n\n" so both the inter-group and final
+    // separators are present.
+    return out.length > 0 ? out.join('\n\n') + '\n\n' : '';
+  }
+
+  return {
+    feed(chunk: Uint8Array): Uint8Array {
+      groupBuffer += decoder.decode(chunk, { stream: true });
+      const out = processBuffer(false);
+      return out.length > 0 ? encoder.encode(out) : new Uint8Array(0);
+    },
+    end(): Uint8Array {
+      groupBuffer += decoder.decode();
+      const out = processBuffer(true);
+      return out.length > 0 ? encoder.encode(out) : new Uint8Array(0);
+    },
+  };
+}

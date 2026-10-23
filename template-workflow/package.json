@@ -1,0 +1,34 @@
+{
+  "name": "template-workflow",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Dario Claude Code template capture, scrub, drift detection and automation",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "template-workflow": "bin/template-workflow.mjs"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/copy-template.mjs",
+    "test": "node scripts/test.mjs",
+    "capture": "node bin/template-workflow.mjs capture",
+    "check": "node bin/template-workflow.mjs check",
+    "status": "node bin/template-workflow.mjs status",
+    "export": "node bin/template-workflow.mjs export",
+    "verify": "node bin/template-workflow.mjs verify",
+    "label-sync": "node bin/template-workflow.mjs label-sync",
+    "drift:npm": "node scripts/check-cc-drift.mjs",
+    "verify:upstream": "node scripts/verify-upstream.mjs",
+    "sync:upstream": "node scripts/sync-upstream.mjs",
+    "prepare:claude": "node bin/template-workflow.mjs prepare-claude",
+    "verify:parity": "node scripts/verify-parity.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.0"
+  }
+}

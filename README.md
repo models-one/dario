@@ -246,3 +246,5 @@ dario is part of **Own Your Stack**, the open toolkit behind **[Sprayberry Labs]
 Built in the open, scars included. Follow the build: **[@ask_alf](https://x.com/ask_alf)** · **[ownyourstack.sprayberrylabs.com](https://ownyourstack.sprayberrylabs.com)**
 
 [^plans]: Pro at $20 a month, Max 5x at $100, Max 20x at $200, as listed on [claude.com/pricing](https://claude.com/pricing) on 2026-09-06. Annual billing is cheaper; check the page for what's current.
+
+Standalone template capture and drift automation lives in [template-workflow/](template-workflow/README.md). Dedicated Actions build, test and release its official-template artifacts. See [repository setup](docs/template-workflow.md).

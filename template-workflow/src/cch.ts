@@ -1,0 +1,186 @@
+// Deterministic Claude Code request-integrity hash (`cch`) — dario#528.
+//
+// Claude Code stamps each /v1/messages request with a 5-hex `cch` token inside
+// the `x-anthropic-billing-header` system block. It is NOT random: it is an
+// xxHash64 over a canonical PROJECTION of the request body, masked to 20 bits.
+// Reverse-engineered by lwsh123k (dario#528) and verified here against live
+// captures on Claude Code 2.1.177:
+//
+//   material = the serialized body, transformed by:
+//     1. reset the `cch=XXXXX` token to `cch=00000`
+//     2. blank the "model" VALUE (keep the key)
+//     3. delete "fallbacks", "fallback_credit_token", "max_tokens"
+//     4. re-serialize as compact JSON (JSON.stringify)
+//   cch = ( xxHash64(material, SEED[version]) & 0xFFFFF ) as zero-padded 5-hex
+//
+// The excluded fields are exactly the ones a routing proxy rewrites (model,
+// fallbacks, max_tokens), so the value is STABLE across dario's rewrites — the
+// upstream re-derives the same projection from whatever we send and recomputes
+// the identical hash. dario therefore only has to hash its own final body.
+//
+// The seed rotates per Claude Code release and is keyed on major.minor.patch
+// (the build-tag suffix, e.g. ".e2d" vs ".dd9", does NOT change it — verified
+// against two captures with different suffixes, same 2.1.177 seed). An unknown
+// version returns null; the caller then OMITS the cch token entirely rather
+// than stamping a random one (see hasCchSeed below).
+//
+// ⚠ Claude Code DROPPED the cch token in a recent release: newer versions send
+// the billing block as `cc_version=…; cc_entrypoint=sdk-cli;` with no `cch=`.
+// So "no seed" and "current Claude Code sends no cch" coincide, and gating cch
+// emission on seed availability keeps dario in step with it: emit cch only when
+// we hold the value to produce it correctly, and otherwise send nothing — which
+// is what current Claude Code sends. A stamped-but-wrong or random cch is worse
+// than none: it's a field current Claude Code no longer includes.
+
+/** Verified per-release seeds, keyed on `major.minor.patch`. */
+export const CCH_SEEDS: Record<string, bigint> = {
+  '2.1.177': 0x4d659218e32a3268n,
+};
+
+/**
+ * Whether a calibrated cch seed exists for `version`. The proxy gates cch
+ * EMISSION on this: with a seed it stamps the deterministic value, without
+ * one it omits the token (matching current Claude Code, which sends no cch).
+ * Keyed on `major.minor.patch` — same key space as CCH_SEEDS.
+ */
+export function hasCchSeed(version: string): boolean {
+  return CCH_SEEDS[version] !== undefined;
+}
+
+const MASK = 0xfffffn;
+const U64 = (1n << 64n) - 1n;
+
+// xxHash64 primes.
+const P1 = 0x9e3779b185ebca87n;
+const P2 = 0xc2b2ae3d27d4eb4fn;
+const P3 = 0x165667b19e3779f9n;
+const P4 = 0x85ebca77c2b2ae63n;
+const P5 = 0x27d4eb2f165667c5n;
+
+const rotl = (x: bigint, r: bigint): bigint => ((x << r) | (x >> (64n - r))) & U64;
+
+function round(acc: bigint, input: bigint): bigint {
+  acc = (acc + input * P2) & U64;
+  acc = rotl(acc, 31n);
+  return (acc * P1) & U64;
+}
+
+function mergeRound(acc: bigint, val: bigint): bigint {
+  const r = round(0n, val);
+  acc = (acc ^ r) & U64;
+  return (acc * P1 + P4) & U64;
+}
+
+/** Canonical xxHash64 of `data` with a 64-bit `seed`. */
+export function xxh64(data: Uint8Array, seed: bigint): bigint {
+  const len = data.length;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let h: bigint;
+  let i = 0;
+
+  if (len >= 32) {
+    let v1 = (seed + P1 + P2) & U64;
+    let v2 = (seed + P2) & U64;
+    let v3 = seed & U64;
+    let v4 = (seed - P1) & U64;
+    const limit = len - 32;
+    while (i <= limit) {
+      v1 = round(v1, dv.getBigUint64(i, true)); i += 8;
+      v2 = round(v2, dv.getBigUint64(i, true)); i += 8;
+      v3 = round(v3, dv.getBigUint64(i, true)); i += 8;
+      v4 = round(v4, dv.getBigUint64(i, true)); i += 8;
+    }
+    h = (rotl(v1, 1n) + rotl(v2, 7n) + rotl(v3, 12n) + rotl(v4, 18n)) & U64;
+    h = mergeRound(h, v1);
+    h = mergeRound(h, v2);
+    h = mergeRound(h, v3);
+    h = mergeRound(h, v4);
+  } else {
+    h = (seed + P5) & U64;
+  }
+
+  h = (h + BigInt(len)) & U64;
+
+  while (i + 8 <= len) {
+    const k1 = round(0n, dv.getBigUint64(i, true));
+    h = (h ^ k1) & U64;
+    h = (rotl(h, 27n) * P1 + P4) & U64;
+    i += 8;
+  }
+  if (i + 4 <= len) {
+    h = (h ^ ((BigInt(dv.getUint32(i, true)) * P1) & U64)) & U64;
+    h = (rotl(h, 23n) * P2 + P3) & U64;
+    i += 4;
+  }
+  while (i < len) {
+    h = (h ^ ((BigInt(data[i]) * P5) & U64)) & U64;
+    h = (rotl(h, 11n) * P1) & U64;
+    i += 1;
+  }
+
+  h = (h ^ (h >> 33n)) & U64;
+  h = (h * P2) & U64;
+  h = (h ^ (h >> 29n)) & U64;
+  h = (h * P3) & U64;
+  h = (h ^ (h >> 32n)) & U64;
+  return h;
+}
+
+// Match the cch token INSIDE the billing tag specifically — never a stray
+// `cch=#####` quoted in conversation content (which sorts before `system` in
+// the body, so a naive first-match would grab it, mis-hash, AND silently
+// rewrite the user's text at stamp time — dario#528). Anchor on the
+// `cc_entrypoint=<value>; cch=` that immediately precedes it in the billing
+// header. The entrypoint value is BOUNDED ({1,32}) so the match stays linear
+// on a 10 MB body — an unbounded `[^"]*?` span here is O(n^2) when the anchor
+// repeats (CodeQL js/polynomial-redos). Anchoring is also what real CC must
+// do, so this matches upstream behavior, not just our own correctness.
+const CCH_RE = /(cc_entrypoint=[a-z0-9-]{1,32}; cch=)[0-9a-fA-F]{5}(?=;)/;
+
+/** Build the canonical cch pre-image bytes from a serialized request body. */
+function cchMaterial(bodyText: string): Uint8Array {
+  const zeroed = bodyText.replace(CCH_RE, (_m, prefix: string) => `${prefix}00000`);
+  const body = JSON.parse(zeroed) as Record<string, unknown>;
+  body.model = '';
+  delete body.fallbacks;
+  delete body.fallback_credit_token;
+  delete body.max_tokens;
+  return new TextEncoder().encode(JSON.stringify(body));
+}
+
+/**
+ * Deterministic 5-hex cch for a serialized body under an EXPLICIT seed, or
+ * null if the body carries no `cch=XXXXX` token. Used by `scripts/cch-
+ * calibrate.mjs` to test candidate seeds against a live capture without going
+ * through the version table.
+ */
+export function cchWithSeed(bodyText: string, seed: bigint): string | null {
+  if (!CCH_RE.test(bodyText)) return null;
+  const h = xxh64(cchMaterial(bodyText), seed) & MASK;
+  return h.toString(16).padStart(5, '0');
+}
+
+/**
+ * Deterministic 5-hex `cch` for a serialized request body, or null when:
+ *  - `version` (major.minor.patch) has no known seed, or
+ *  - the body carries no `cch=XXXXX` billing token to stamp.
+ * A null return means the caller should keep its random placeholder.
+ */
+export function cchForBody(bodyText: string, version: string): string | null {
+  const seed = CCH_SEEDS[version];
+  if (seed === undefined) return null;
+  return cchWithSeed(bodyText, seed);
+}
+
+/**
+ * Return `bodyText` with the billing-tag cch replaced in place by the
+ * deterministic value for `version`, or unchanged when the version has no
+ * known seed or the body has no billing token. The replacement is anchored to
+ * the billing tag (CCH_RE), so conversation content that quotes a cch is never
+ * touched. Used by the proxy at outbound-serialize time.
+ */
+export function stampCch(bodyText: string, version: string): string {
+  const cch = cchForBody(bodyText, version);
+  if (cch === null) return bodyText;
+  return bodyText.replace(CCH_RE, (_m, prefix: string) => `${prefix}${cch}`);
+}

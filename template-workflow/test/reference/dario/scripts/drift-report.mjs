@@ -1,0 +1,991 @@
+// Pure functions for the --check drift detector in `capture-and-bake.mjs`.
+// Lives in its own module so the test suite can exercise drift detection
+// without spawning a live CC capture (the top of capture-and-bake.mjs
+// kicks off captureLiveTemplateAsync at import time, which is not what
+// unit tests want).
+//
+// Added in v4.5.0 — unified-diff snippets in drift reports.
+
+/**
+ * Betas that `betaForModel()` (src/proxy.ts) appends to the base set per-request
+ * based on the model — they are deliberately NOT part of the baked base set. A
+ * live `--check` capture carries them depending on which model the capture used
+ * (e.g. `context-1m` rides `[1m]` requests, `fallback-credit` rides fable), so
+ * comparing them against the base would false-positive on every run forever
+ * (issue #484). Excluded from the anthropic_beta drift comparison on both sides.
+ * Keep in sync with CONTEXT_1M_BETA / FABLE_FALLBACK_CREDIT_BETA in src/proxy.ts.
+ */
+export const MODEL_CONDITIONAL_BETAS = new Set([
+  'context-1m-2025-08-07',      // CONTEXT_1M_BETA — appended for [1m]-labelled requests only
+  'fallback-credit-2026-06-01', // FABLE_FALLBACK_CREDIT_BETA — appended for fable requests only
+]);
+
+/**
+ * Betas CC toggles by REMOTE CONFIG, independent of its version.
+ *
+ * Distinct from MODEL_CONDITIONAL_BETAS above, which are flags dario itself
+ * appends per-request — those are ours, and comparing them against a base that
+ * never carried them is a false positive we manufactured. These are CC's own:
+ * it sends them or it does not, on Anthropic's schedule, and a bake captures
+ * whichever state happened to be live that minute.
+ *
+ * Observed 2026-07-26: afk-mode flipped off (auto-rebake #869, 04:51Z), on
+ * (8/8 captures at 15:45Z, baked into 5.4.13), then off again (#878, 16:45Z) —
+ * four transitions in twelve hours. Each flip opened a rebake PR, bumped a
+ * version and cut a full release: multi-arch GHCR build, Sigstore attestation,
+ * npm publish, autodeploy. Release churn on Anthropic's remote-config cadence.
+ *
+ * Stripping is safe in both directions. betaForModel() documents that its
+ * per-family shape is correct whether or not the base carries afk-mode — the
+ * anchor-relative inserts degrade to append/no-op when the anchor is absent —
+ * and `removing a beta can never provoke an upstream 400`. Sending it is the
+ * side with a cost: afk-mode is rejected on Max 5x, which the unavailableBetas
+ * recovery absorbs at one 400 per account. So a base without it is strictly
+ * cheaper than a base that oscillates.
+ *
+ * The tradeoff, stated plainly: dario's beta set differs from CC's by this one
+ * flag whenever CC is sending it. That is a deliberate divergence from wire
+ * fidelity, taken because the alternative is a release per flip.
+ */
+export const REMOTE_CONFIG_CONDITIONAL_BETAS = new Set([
+  'afk-mode-2026-01-31', // AFK_MODE_BETA in src/proxy.ts — remote-config gated
+]);
+
+/**
+ * Strip the betas that must not reach the baked base: the model-conditional ones
+ * betaForModel() appends per-request, and the remote-config ones CC toggles on
+ * Anthropic's schedule (see the two sets above).
+ *
+ * Historical note on the name: it predates the remote-config class and is kept
+ * from a comma-joined beta string. Used by the BAKE path (capture-and-bake.mjs) so
+ * the canonical base set written to cc-template-data.json never carries them — a
+ * live capture that happened to ride them (e.g. a `[1m]` request carrying
+ * context-1m) would otherwise re-introduce them to the base on every rebake,
+ * undoing #475's design. Mirrors the filter computeDrift applies for detection.
+ */
+export function stripModelConditionalBetas(beta) {
+  return (beta || '')
+    .split(',')
+    .filter(Boolean)
+    .filter((b) => !MODEL_CONDITIONAL_BETAS.has(b) && !REMOTE_CONFIG_CONDITIONAL_BETAS.has(b))
+    .join(',');
+}
+
+/**
+ * True when `live` is a strictly OLDER CC version than `bundled`. Used by the
+ * stale-binary guard in capture-and-bake.mjs: a runner whose installed CC is
+ * older than the CC that produced the current bundle re-captures yesterday's
+ * wire shape and reports it as "drift" — which reached the ship gate as a
+ * template DOWNGRADE on 2026-07-02 (PR #632: runner at 2.1.197 against a
+ * 2.1.198-baked bundle). An older binary cannot observe forward drift.
+ *
+ * Fails OPEN: if either version is missing or doesn't parse as dotted
+ * numerics (optional leading `v`), returns false — the guard must never
+ * block a legitimate bake over a weird version string; shape detection
+ * still applies downstream.
+ */
+export function isOlderCCVersion(live, bundled) {
+  const parse = (v) => {
+    if (typeof v !== 'string') return null;
+    const m = v.trim().replace(/^v/, '');
+    if (!/^\d+(\.\d+)*$/.test(m)) return null;
+    return m.split('.').map(Number);
+  };
+  const a = parse(live);
+  const b = parse(bundled);
+  if (!a || !b) return false;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (x !== y) return x < y;
+  }
+  return false;
+}
+
+/**
+ * Collapse the environment-specific CC memory directory path to a placeholder so
+ * a cross-OS bake doesn't read as system_prompt drift: the bundle may be baked on
+ * one platform (e.g. Windows `C:\Users\user\.claude\projects\…\memory\`) while the
+ * drift-watch runner captures another (`/root/.claude/projects/project/memory/`).
+ * That line differs on every cross-host bake and is not CC drift (issue #484).
+ * Matches the backtick-quoted path token containing both `.claude` and `memory`.
+ */
+export function normalizeMemoryPath(s) {
+  return (s || '').replace(/`[^`]*\.claude[^`]*memory[^`]*`/g, '`<MEMORY_DIR>`');
+}
+
+/**
+ * Generate a line-level unified diff between two text blobs. Bounded
+ * output for issue / PR embedding. Each line is prefixed with
+ * ` ` (context), `-` (removed), `+` (added), or `  …` (truncation /
+ * hunk separator).
+ *
+ * Algorithm: LCS-table backtrack — O(mn) time/space, fine for scrubbed-
+ * system-prompt-sized inputs (~12 KB / ~200 lines in current bakes).
+ *
+ * Returns an empty array when the two inputs are identical.
+ */
+export function unifiedDiff(prev, now, opts = {}) {
+  const { contextLines = 2, maxLines = 60 } = opts;
+  const a = (prev || '').split('\n');
+  const b = (now || '').split('\n');
+  const m = a.length;
+  const n = b.length;
+
+  // Length of LCS for prefixes a[0..i-1] and b[0..j-1].
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+
+  // Backtrack to produce ops, then reverse.
+  const ops = [];
+  let i = m;
+  let j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && a[i - 1] === b[j - 1]) {
+      ops.push({ k: ' ', s: a[i - 1] });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      ops.push({ k: '+', s: b[j - 1] });
+      j--;
+    } else {
+      ops.push({ k: '-', s: a[i - 1] });
+      i--;
+    }
+  }
+  ops.reverse();
+
+  // Find indices of changed ops; expand context around each.
+  const changed = [];
+  for (let k = 0; k < ops.length; k++) {
+    if (ops[k].k !== ' ') changed.push(k);
+  }
+  if (changed.length === 0) return [];
+
+  const keep = new Set();
+  for (const idx of changed) {
+    keep.add(idx);
+    for (let c = 1; c <= contextLines; c++) {
+      if (idx - c >= 0) keep.add(idx - c);
+      if (idx + c < ops.length) keep.add(idx + c);
+    }
+  }
+  const sorted = [...keep].sort((x, y) => x - y);
+
+  const out = [];
+  let lastIdx = -2;
+  for (let s = 0; s < sorted.length; s++) {
+    const idx = sorted[s];
+    if (idx > lastIdx + 1) out.push('  …');
+    out.push(ops[idx].k + ops[idx].s);
+    lastIdx = idx;
+    if (out.length >= maxLines) {
+      const remaining = sorted.length - s - 1;
+      if (remaining > 0) {
+        out.push(`  … (${remaining} more changed/context line${remaining === 1 ? '' : 's'} truncated)`);
+      }
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Describe a tool for the drift report — first 100 chars of description,
+ * + input_schema property keys. Used to give a reviewer context on what
+ * a newly-added (or removed) tool actually does.
+ */
+export function describeTool(tool) {
+  if (!tool) return [];
+  const lines = [];
+  const desc = (tool.description || '').split('\n')[0];
+  if (desc) {
+    lines.push(`${tool.name}: ${desc.slice(0, 100)}${desc.length > 100 ? '…' : ''}`);
+  } else {
+    lines.push(tool.name);
+  }
+  const props = tool.input_schema?.properties;
+  if (props && typeof props === 'object') {
+    const keys = Object.keys(props);
+    if (keys.length > 0) lines.push(`  input keys: ${keys.join(', ')}`);
+  }
+  return lines;
+}
+
+/**
+ * Compute the meaningful template drift between `prev` (current bundled)
+ * and `now` (freshly captured + scrubbed). Returns an array of entries —
+ * each with a `summary` line and an optional `detail` array of lines that
+ * the caller renders indented under the summary.
+ *
+ * Intentionally ignores transient fields that always differ between runs:
+ *   - `_captured` (timestamp)
+ *   - `header_values['user-agent']` (varies by CC version; label-sync rewrites it)
+ *   - the header values the proxy never replays (`x-api-key`, `x-stainless-os`,
+ *     `x-stainless-arch`: capture artifacts and the capturing host)
+ *   - `_version`, `_supportedMaxTested` (the point of --check is to catch
+ *     drift WITHIN the same version, so a version-string diff isn't drift)
+ *
+ * Catches drift in:
+ *   - tools (added / removed by name; detail shows description + schema keys)
+ *   - tool descriptions, tool input schemas and tool order, for tools on both
+ *     sides: the proxy sends the bundle's definitions in the bundle's order
+ *   - header_values the proxy replays onto every request
+ *   - anthropic_beta header value (added / removed lists)
+ *   - system_prompt content (any character delta; detail is a unified diff)
+ *   - body_field_order (detail shows the before / after JSON)
+ *   - header_order (detail shows the before / after JSON)
+ *   - agent_identity content (detail is a unified diff)
+ *
+ * v4.5.0 added the rich `{ summary, detail }` entry format; previously each
+ * entry was a single summary string.
+ */
+/**
+ * Header values computeDrift does not compare: the ones the proxy never replays
+ * (a capture artifact and the capturing host) and user-agent, which carries the
+ * CC version and is rewritten by the label-only path.
+ */
+const UNCOMPARED_HEADER_VALUES = new Set(['user-agent', 'x-api-key', 'x-stainless-os', 'x-stainless-arch']);
+
+export function computeDrift(prev, now) {
+  const out = [];
+
+  // tools — by name set, detail = description + schema keys
+  const prevTools = new Map((prev.tools || []).map((t) => [t.name, t]));
+  const nowTools = new Map((now.tools || []).map((t) => [t.name, t]));
+  const addedTools = [...nowTools.keys()].filter((n) => !prevTools.has(n));
+  const removedTools = [...prevTools.keys()].filter((n) => !nowTools.has(n));
+  if (addedTools.length > 0) {
+    out.push({
+      summary: `tools added: ${addedTools.join(', ')}`,
+      detail: addedTools.flatMap((n) => describeTool(nowTools.get(n))),
+    });
+  }
+  if (removedTools.length > 0) {
+    out.push({
+      summary: `tools removed: ${removedTools.join(', ')}`,
+      detail: removedTools.flatMap((n) => describeTool(prevTools.get(n))),
+    });
+  }
+
+  // Tools on both sides: description, input schema and order. The proxy sends
+  // the bundle's definitions in the bundle's order, so any of these is a change
+  // in what requests built from the bundle carry.
+  {
+    const shared = [...nowTools.keys()].filter((n) => prevTools.has(n));
+    const descChanged = shared.filter((n) => (prevTools.get(n).description || '') !== (nowTools.get(n).description || ''));
+    const schemaChanged = shared.filter((n) =>
+      JSON.stringify(prevTools.get(n).input_schema ?? null) !== JSON.stringify(nowTools.get(n).input_schema ?? null));
+    if (descChanged.length > 0) {
+      out.push({
+        summary: `tool descriptions changed: ${descChanged.join(', ')}`,
+        detail: descChanged.map((n) =>
+          `${n}: from ${(prevTools.get(n).description || '').length} to ${(nowTools.get(n).description || '').length} chars`),
+      });
+    }
+    // defer_loading rides on the definition CC sends; a flip changes the wire shape.
+    const deferChanged = shared.filter((n) => (prevTools.get(n).defer_loading === true) !== (nowTools.get(n).defer_loading === true));
+    if (deferChanged.length > 0) {
+      out.push({
+        summary: `tool defer_loading changed: ${deferChanged.join(', ')}`,
+        detail: deferChanged.map((n) => `${n}: defer_loading ${prevTools.get(n).defer_loading === true} now ${nowTools.get(n).defer_loading === true}`),
+      });
+    }
+    if (schemaChanged.length > 0) {
+      out.push({
+        summary: `tool input schemas changed: ${schemaChanged.join(', ')}`,
+        detail: schemaChanged.map((n) => {
+          const keys = (t) => Object.keys(t.input_schema?.properties ?? {}).join(', ') || '(none)';
+          return `${n}: input keys ${keys(prevTools.get(n))} now ${keys(nowTools.get(n))}`;
+        }),
+      });
+    }
+    const prevOrder = (prev.tools || []).map((t) => t.name).filter((n) => nowTools.has(n));
+    const nowOrder = (now.tools || []).map((t) => t.name).filter((n) => prevTools.has(n));
+    if (JSON.stringify(prevOrder) !== JSON.stringify(nowOrder)) {
+      out.push({
+        summary: 'tool order changed',
+        detail: [`- ${JSON.stringify(prevOrder)}`, `+ ${JSON.stringify(nowOrder)}`],
+      });
+    }
+  }
+
+  // header_values the proxy replays (overlayTemplateHeaderValues in
+  // src/cc-template.ts). The ones it never replays describe the capture, and
+  // user-agent carries the CC version, which the label-only path rewrites.
+  {
+    const ph = prev.header_values || {};
+    const nh = now.header_values || {};
+    const keys = [...new Set([...Object.keys(ph), ...Object.keys(nh)])].sort()
+      .filter((k) => !UNCOMPARED_HEADER_VALUES.has(k.toLowerCase()) && ph[k] !== nh[k]);
+    if (keys.length > 0) {
+      out.push({
+        summary: `header_values changed: ${keys.join(', ')}`,
+        detail: keys.map((k) => `${k}: ${ph[k] ?? '(absent)'} now ${nh[k] ?? '(absent)'}`),
+      });
+    }
+  }
+
+  // anthropic_beta — added/removed sets, ignoring two classes of flag.
+  // The model-conditional ones betaForModel() appends per-request: the bundle's
+  // anthropic_beta is the BASE set, so context-1m / fallback-credit ride a live
+  // capture without being base drift (#484). And the remote-config ones CC
+  // toggles on Anthropic's schedule, which flip faster than a release can ship
+  // (afk-mode moved four times in twelve hours on 2026-07-26).
+  //
+  // Filtered from BOTH sides so the exclusion is symmetric — a base that still
+  // carries an excluded flag from an older bake does not read as drift either.
+  // Every other beta is still compared, so a genuine base-beta change surfaces.
+  {
+    const stripManaged = (s) =>
+      new Set((s || '').split(',').filter(Boolean)
+        .filter((b) => !MODEL_CONDITIONAL_BETAS.has(b) && !REMOTE_CONFIG_CONDITIONAL_BETAS.has(b)));
+    const prevBetas = stripManaged(prev.anthropic_beta);
+    const nowBetas = stripManaged(now.anthropic_beta);
+    const addedB = [...nowBetas].filter((b) => !prevBetas.has(b));
+    const removedB = [...prevBetas].filter((b) => !nowBetas.has(b));
+    if (addedB.length > 0) out.push({ summary: `anthropic_beta added: ${addedB.join(', ')}` });
+    if (removedB.length > 0) out.push({ summary: `anthropic_beta removed: ${removedB.join(', ')}` });
+  }
+
+  // system_prompt — content (detail = unified diff). Normalize the env-specific
+  // memory directory path first so a cross-host bake (e.g. Windows bundle vs
+  // Linux runner capture) doesn't read as drift on that one line. All other
+  // content is still compared verbatim, so a real prompt edit still surfaces.
+  {
+    const prevSp = normalizeMemoryPath(prev.system_prompt || '');
+    const nowSp = normalizeMemoryPath(now.system_prompt || '');
+    if (prevSp !== nowSp) {
+      const delta = nowSp.length - prevSp.length;
+      out.push({
+        summary: `system_prompt content changed (${prevSp.length} → ${nowSp.length} chars, delta ${delta >= 0 ? '+' : ''}${delta})`,
+        detail: unifiedDiff(prevSp, nowSp),
+      });
+    }
+  }
+
+  // body_field_order — array deep-equal
+  if (JSON.stringify(prev.body_field_order || []) !== JSON.stringify(now.body_field_order || [])) {
+    out.push({
+      summary: 'body_field_order changed',
+      detail: [
+        `- ${JSON.stringify(prev.body_field_order)}`,
+        `+ ${JSON.stringify(now.body_field_order)}`,
+      ],
+    });
+  }
+
+  // header_order — array deep-equal
+  if (JSON.stringify(prev.header_order || []) !== JSON.stringify(now.header_order || [])) {
+    out.push({
+      summary: 'header_order changed',
+      detail: [
+        `- ${JSON.stringify(prev.header_order)}`,
+        `+ ${JSON.stringify(now.header_order)}`,
+      ],
+    });
+  }
+
+  // agent_identity — exact string, detail = unified diff
+  if ((prev.agent_identity || '') !== (now.agent_identity || '')) {
+    const prevLen = (prev.agent_identity || '').length;
+    const nowLen = (now.agent_identity || '').length;
+    out.push({
+      summary: `agent_identity content changed (${prevLen} → ${nowLen} chars)`,
+      detail: unifiedDiff(prev.agent_identity || '', now.agent_identity || ''),
+    });
+  }
+
+  return out;
+}
+
+/**
+ * Render a drift report (from `computeDrift`) into the line list that
+ * `capture-and-bake.mjs --check` logs through `log()`. Each summary
+ * appears as a bullet; each detail line is indented under its bullet so
+ * the [bake] prefix doesn't break the visual hierarchy.
+ */
+export function formatDriftReport(diff) {
+  const lines = [];
+  for (const item of diff) {
+    lines.push(`  • ${item.summary}`);
+    if (item.detail && item.detail.length > 0) {
+      for (const d of item.detail) lines.push(`      ${d}`);
+    }
+  }
+  return lines;
+}
+
+/**
+ * Classify drift entries into a structured summary + a one-word
+ * verdict the reviewer can scan at a glance. v4.7.0 — built so the
+ * auto-rebake bot's PR body can lead with "ship this" or "investigate"
+ * instead of forcing the reviewer to skim a unified-line diff.
+ *
+ * Verdicts (in increasing severity):
+ *   - 'benign'       — only text content changed (system_prompt /
+ *                      agent_identity / tool descriptions). No tool
+ *                      added/removed, no structural shifts. The vast
+ *                      majority of class-B drift events.
+ *   - 'moderate'     — tools added (CC gained a capability), beta
+ *                      headers added/removed (CC opted into/out of
+ *                      a feature flag), agent_identity changed.
+ *                      Probably ship, but worth a closer read.
+ *   - 'substantive'  — tools REMOVED, body_field_order / header_order
+ *                      changed. These can break dario's canonical-
+ *                      rebuild path; don't auto-trust.
+ *
+ * The categorization is conservative — when in doubt, escalate. False
+ * positives (calling something substantive when it's actually fine) waste
+ * a reviewer's attention; false negatives (calling something benign when
+ * it can break clients) waste subscribers' money via reclassification.
+ */
+export function interpretDrift(diff) {
+  const summary = {
+    toolsAdded: [],
+    toolsRemoved: [],
+    betasAdded: [],
+    betasRemoved: [],
+    systemPromptDelta: 0,
+    agentIdentityChanged: false,
+    bodyFieldOrderChanged: false,
+    headerOrderChanged: false,
+    toolDescriptionsChanged: [],
+    toolSchemasChanged: [],
+    toolOrderChanged: false,
+    headerValuesChanged: [],
+  };
+  const names = (s, prefix) => s.replace(prefix, '').trim().split(',').map((t) => t.trim()).filter(Boolean);
+
+  for (const entry of diff) {
+    const s = entry.summary;
+    if (s.startsWith('tools added:')) {
+      summary.toolsAdded = s.replace('tools added:', '').trim().split(',').map((t) => t.trim()).filter(Boolean);
+    } else if (s.startsWith('tools removed:')) {
+      summary.toolsRemoved = s.replace('tools removed:', '').trim().split(',').map((t) => t.trim()).filter(Boolean);
+    } else if (s.startsWith('anthropic_beta added:')) {
+      summary.betasAdded = s.replace('anthropic_beta added:', '').trim().split(',').map((t) => t.trim()).filter(Boolean);
+    } else if (s.startsWith('anthropic_beta removed:')) {
+      summary.betasRemoved = s.replace('anthropic_beta removed:', '').trim().split(',').map((t) => t.trim()).filter(Boolean);
+    } else if (s.startsWith('system_prompt content changed')) {
+      const m = s.match(/delta ([+-]?\d+)/);
+      if (m) summary.systemPromptDelta = parseInt(m[1], 10);
+    } else if (s.startsWith('agent_identity content changed')) {
+      summary.agentIdentityChanged = true;
+    } else if (s === 'body_field_order changed') {
+      summary.bodyFieldOrderChanged = true;
+    } else if (s === 'header_order changed') {
+      summary.headerOrderChanged = true;
+    } else if (s.startsWith('tool descriptions changed:')) {
+      summary.toolDescriptionsChanged = names(s, 'tool descriptions changed:');
+    } else if (s.startsWith('tool input schemas changed:')) {
+      summary.toolSchemasChanged = names(s, 'tool input schemas changed:');
+    } else if (s === 'tool order changed') {
+      summary.toolOrderChanged = true;
+    } else if (s.startsWith('header_values changed:')) {
+      summary.headerValuesChanged = names(s, 'header_values changed:');
+    }
+  }
+
+  // Verdict ladder. Each tier dominates the ones below it.
+  let verdict;
+  if (summary.toolsRemoved.length > 0 || summary.bodyFieldOrderChanged || summary.headerOrderChanged) {
+    verdict = 'substantive';
+  } else if (summary.toolsAdded.length > 0 || summary.betasAdded.length > 0 || summary.betasRemoved.length > 0 || summary.agentIdentityChanged
+    || summary.toolSchemasChanged.length > 0 || summary.toolOrderChanged || summary.headerValuesChanged.length > 0) {
+    verdict = 'moderate';
+  } else {
+    verdict = 'benign';
+  }
+
+  return { ...summary, verdict };
+}
+
+/**
+ * Render the interpreted drift summary as a human-scannable markdown
+ * block — used at the top of the auto-rebake PR body and (in compact
+ * form) the --check log output. Each line is its own list item; the
+ * verdict gets a leading emoji + bold label.
+ */
+export function formatDriftSummary(interpretation) {
+  const lines = [];
+  const v = interpretation.verdict;
+  const verdictEmoji = v === 'benign' ? '✅' : v === 'moderate' ? '🟡' : '🔴';
+  // Moderate names the check a reviewer runs, not just a severity: every moderate
+  // axis changes what the canonical-rebuild path sends upstream.
+  const verdictLabel = v === 'benign' ? 'Benign'
+    : v === 'moderate' ? 'Moderate: verify that requests rebuilt from the bundled template are still accepted upstream with the change below'
+    : 'Substantive — investigate before merging';
+  lines.push(`**Verdict:** ${verdictEmoji} ${verdictLabel}`);
+  lines.push('');
+
+  if (interpretation.toolsAdded.length > 0) {
+    lines.push(`- **Tools added:** \`${interpretation.toolsAdded.join('`, `')}\` (CC gained a capability)`);
+  }
+  if (interpretation.toolsRemoved.length > 0) {
+    lines.push(`- **Tools removed:** \`${interpretation.toolsRemoved.join('`, `')}\` ⚠ (can break canonical-rebuild paths)`);
+  }
+  if (interpretation.betasAdded.length > 0) {
+    lines.push(`- **anthropic_beta added:** \`${interpretation.betasAdded.join('`, `')}\` (CC opted into a feature flag)`);
+  }
+  if (interpretation.betasRemoved.length > 0) {
+    lines.push(`- **anthropic_beta removed:** \`${interpretation.betasRemoved.join('`, `')}\` (CC opted out of a feature flag)`);
+  }
+  if (interpretation.systemPromptDelta !== 0) {
+    const sign = interpretation.systemPromptDelta > 0 ? '+' : '';
+    lines.push(`- **system_prompt:** ${sign}${interpretation.systemPromptDelta} chars net (text-content drift — see unified diff below)`);
+  }
+  if (interpretation.agentIdentityChanged) {
+    lines.push(`- **agent_identity:** changed (CC's "You are..." line shifted — affects classifier signal #4)`);
+  }
+  if (interpretation.bodyFieldOrderChanged) {
+    lines.push(`- **body_field_order:** changed ⚠ (classifier signal #7 — affects every request shape)`);
+  }
+  if (interpretation.headerOrderChanged) {
+    lines.push(`- **header_order:** changed (HTTP/2 header sequence — affects classifier signal)`);
+  }
+  if ((interpretation.toolDescriptionsChanged ?? []).length > 0) {
+    lines.push(`- **Tool descriptions changed:** \`${interpretation.toolDescriptionsChanged.join('`, `')}\` (text the proxy sends with each tool)`);
+  }
+  if ((interpretation.toolSchemasChanged ?? []).length > 0) {
+    lines.push(`- **Tool input schemas changed:** \`${interpretation.toolSchemasChanged.join('`, `')}\``);
+  }
+  if (interpretation.toolOrderChanged) {
+    lines.push('- **Tool order:** changed (the proxy sends the tools in the bundle order)');
+  }
+  if ((interpretation.headerValuesChanged ?? []).length > 0) {
+    lines.push(`- **Header values changed:** \`${interpretation.headerValuesChanged.join('`, `')}\` (replayed onto every request)`);
+  }
+
+  if (lines.length === 2) {
+    // Verdict line + blank, no axis bullets — should not happen if the
+    // diff was non-empty, but defensive.
+    lines.push('- *(no specific axes flagged — drift detector returned an empty interpretation)*');
+  }
+
+  return lines;
+}
+
+// ── #881 tripwire: the intermittent +279-char base-prompt residue ─────
+//
+// About one local capture in ten, the scrubbed BASE system prompt comes back
+// 5038 chars instead of the usual 4759 — an extra `# Context management`
+// paragraph that is not in the baked bundle. Root cause unknown (dario#881);
+// 26h of CI data says it has never reached the Linux runner, and #881
+// deliberately defers any bake-time normalisation ("should not be taken on a
+// hunch"). So this is a DETECTOR ONLY: it never strips, rewrites or suppresses
+// anything. Its whole job is to make a 5038 capture impossible to mistake for
+// a genuine CC prompt change if it ever does reach CI and auto-opens a rebake
+// PR.
+
+/**
+ * The paragraph's opening sentence. `# Context management` alone is useless as
+ * a discriminator — the CURRENT 4759-char bundle already has that heading, so
+ * matching on it would flag every clean capture. This sentence is the part
+ * that only appears in the 5038 readings.
+ */
+export const ISSUE_881_MARKER =
+  'When you have enough information to act, act.';
+
+/** Scrubbed base lengths from #881: the normal reading and the anomalous one. */
+export const ISSUE_881_BASELINE_LEN = 4759;
+export const ISSUE_881_ANOMALY_LEN = 5038;
+
+/**
+ * Decide whether a scrubbed base capture carries the #881 residue relative to
+ * the bundled template.
+ *
+ * Two independent clauses, either sufficient:
+ *
+ *  1. **Marker clause** — the capture contains the marker sentence and the
+ *     bundle does not. This is the primary signal and survives the paragraph's
+ *     wording drifting in length.
+ *  2. **Length clause** — the capture is exactly 5038 and the bundle exactly
+ *     4759, the pair documented in #881. A backstop for the case where the
+ *     sentence gets reworded but the byte count still lands on the known pair.
+ *
+ * Both clauses are relative to the bundle, which is what keeps the tripwire
+ * from becoming permanent noise: if the paragraph is ever legitimately baked
+ * in, the bundle gains the marker (and stops being 4759), both clauses go
+ * false, and the detector silently disarms with no code change.
+ *
+ * A genuine CC prompt change — #881 cites the real 4754 -> 4759 step — trips
+ * neither clause, so it flows through as ordinary drift. That specificity is
+ * the point: flagging every base-length change would defeat the tripwire.
+ *
+ * @param {string} capturedPrompt scrubbed base system_prompt from the live capture
+ * @param {string} bundledPrompt  system_prompt from src/cc-template-data.json
+ * @returns {{detected: boolean, reason: string|null, capturedLen: number, bundledLen: number}}
+ */
+export function detectIssue881Residue(capturedPrompt, bundledPrompt) {
+  const captured = typeof capturedPrompt === 'string' ? capturedPrompt : '';
+  const bundled = typeof bundledPrompt === 'string' ? bundledPrompt : '';
+  const result = { detected: false, reason: null, capturedLen: captured.length, bundledLen: bundled.length };
+
+  if (captured.includes(ISSUE_881_MARKER) && !bundled.includes(ISSUE_881_MARKER)) {
+    result.detected = true;
+    result.reason = 'marker';
+    return result;
+  }
+  if (captured.length === ISSUE_881_ANOMALY_LEN && bundled.length === ISSUE_881_BASELINE_LEN) {
+    result.detected = true;
+    result.reason = 'length';
+    return result;
+  }
+  return result;
+}
+
+/**
+ * Render the tripwire hit for the `--check` log. Line 1 is a GitHub Actions
+ * `::warning::` annotation, so a hit surfaces on the run summary rather than
+ * being buried in step output; the rest is prose for the human reading the
+ * drift issue / PR body, both of which embed this stream verbatim.
+ *
+ * The annotation is emitted unconditionally rather than gated on `$GITHUB_ACTIONS`
+ * — outside Actions it is just a prefixed line, and gating on the env var would
+ * make the one path that matters the one path that is never exercised locally.
+ */
+export function formatIssue881Warning(detection) {
+  const via = detection.reason === 'marker'
+    ? `the "${ISSUE_881_MARKER}" marker sentence is in the capture but not the bundle`
+    : `the capture is exactly ${ISSUE_881_ANOMALY_LEN} chars against a ${ISSUE_881_BASELINE_LEN}-char bundle`;
+  return [
+    `::warning title=dario#881 base-prompt residue::Base system prompt captured at ${detection.capturedLen} chars vs ${detection.bundledLen} bundled — matches the KNOWN dario#881 anomaly (${via}). Any rebake PR from this run is #881 residue, NOT a genuine CC prompt change. Do not merge without reading https://github.com/askalf/dario/issues/881`,
+    '',
+    'TRIPWIRE: dario#881 — intermittent +279-char base-prompt residue',
+    `  captured base: ${detection.capturedLen} chars`,
+    `  bundled base:  ${detection.bundledLen} chars`,
+    `  matched via:   ${detection.reason} clause (${via})`,
+    '',
+    '  This capture carries the extra "# Context management" paragraph that #881',
+    '  documents as appearing in roughly 1 local capture in 10 and never (until now)',
+    '  in CI. Treat any resulting rebake PR as #881 residue until proven otherwise:',
+    '  the base prompt did not change upstream, this run captured it wrong.',
+    '',
+    '  Do NOT merge the rebake on the assumption that CC edited its prompt. Re-run the',
+    '  workflow; if the next capture comes back clean, this was the anomaly. Comment the',
+    '  outcome on #881 either way — the correlating conditions are what that issue needs.',
+  ];
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Content-empty rebake guard (dario#990)
+// ──────────────────────────────────────────────────────────────────────
+//
+// `cc-drift-template-watch.yml`'s auto-rebake step gates on
+// `git diff --quiet -- src/cc-template-data.json` to answer "did the bake
+// actually change the bundle?". That gate CANNOT fire: every
+// `capture-and-bake` run stamps a fresh `_captured` timestamp, so the file is
+// always textually dirty even when the wire shape is byte-identical. A
+// transient `--check` capture therefore reaches the ship gate as a PR with a
+// version bump and a "wire-fingerprint drift" CHANGELOG entry describing a
+// change that isn't in the diff.
+//
+// Live case: PR #990 (v5.5.18). Every content key — tools, system_prompt,
+// system_prompt_variants, anthropic_beta, header_order, header_values,
+// body_field_order, agent_identity — was identical to v5.5.17; only
+// `_captured` moved. The `--check` capture had matched the dario#881 residue
+// signature, the bake's own capture had not, and nothing downstream noticed
+// that the two disagreed to the point of an empty bundle.
+
+/**
+ * Fields a bake rewrites unconditionally, independent of wire shape. Only
+ * `_captured` qualifies: it is a provenance stamp for WHEN the capture ran,
+ * never a statement about what the capture found.
+ *
+ * Deliberately narrow. `_version` / `_supportedMaxTested` / the user-agent
+ * header are NOT here — when those move the bundle genuinely ships something
+ * (that is the whole content of a label-sync PR), so a rebake carrying only a
+ * version-label move is still worth opening.
+ */
+export const TRANSIENT_TEMPLATE_FIELDS = new Set(['_captured']);
+
+/**
+ * Top-level keys whose value differs between two baked templates, ignoring
+ * `TRANSIENT_TEMPLATE_FIELDS`. Compared by canonical JSON so key order inside
+ * a nested object never reads as a change.
+ *
+ * An empty result means the freshly-baked bundle ships nothing: the capture
+ * that triggered the rebake was transient, and merging would cut a release for
+ * a wire-shape change that did not happen upstream.
+ */
+export function meaningfulTemplateKeys(prev, now) {
+  const keys = new Set([...Object.keys(prev || {}), ...Object.keys(now || {})]);
+  const changed = [];
+  for (const k of keys) {
+    if (TRANSIENT_TEMPLATE_FIELDS.has(k)) continue;
+    if (JSON.stringify(prev?.[k]) !== JSON.stringify(now?.[k])) changed.push(k);
+  }
+  return changed.sort();
+}
+
+// ── What a rebake changes, read from the two bundles ─────────────────
+//
+// The --check report says why the watcher fired. A rebake ships more than
+// that: the bake writes the whole capture, so tool text, header values and
+// the version label move with it even when the check named one prompt
+// variant. The rebake PR's description and its release note are therefore
+// written from the two bundles, the one on the base branch and the one the
+// bake produced. They describe the diff under review and nothing else.
+//
+// Every sentence they produce is about what the BUNDLE holds. What a request
+// carries also depends on the proxy: it prefers a fresh live capture to the
+// bundle, sets some headers itself after overlaying the captured values, and
+// manages some beta flags per request. Where a sentence mentions requests, it
+// says requests built from the bundled template.
+
+/**
+ * Captured header values that describe the capturing host or are a capture
+ * artifact, not Claude Code's wire shape. Their values are not printed; when
+ * one of them differs, `header_values` is named as not broken down.
+ */
+const UNDESCRIBED_HEADER_VALUES = new Set(['x-api-key', 'x-stainless-os', 'x-stainless-arch']);
+
+/** A family key read as a name: `sonnet-5` gives `Sonnet 5`. */
+export function familyLabel(key) {
+  return String(key).split('-').map((p) => (/^[a-z]/.test(p) ? p[0].toUpperCase() + p.slice(1) : p)).join(' ');
+}
+
+/**
+ * Everything that differs between two bundles, as data. `prev` is the bundle
+ * being replaced, `now` the freshly baked one.
+ *
+ * A tool counts as changed when its description or input schema differs.
+ * `otherKeys` names every top-level key that differs in a way not accounted
+ * for field by field here (an extra field on a tool, the A/B shape memory),
+ * so that a summary does not read as if that key had not moved.
+ */
+export function describeBundleChange(prev, now) {
+  const pv = prev.system_prompt_variants ?? {};
+  const nv = now.system_prompt_variants ?? {};
+  const variants = [...new Set([...Object.keys(pv), ...Object.keys(nv)])].sort()
+    .filter((k) => (pv[k] ?? '') !== (nv[k] ?? ''))
+    .map((k) => ({ key: k, before: (pv[k] ?? '').length, after: (nv[k] ?? '').length }));
+
+  const prevTools = new Map((prev.tools ?? []).map((t) => [t.name, t]));
+  const nowTools = new Map((now.tools ?? []).map((t) => [t.name, t]));
+  const toolsAdded = [...nowTools.keys()].filter((n) => !prevTools.has(n));
+  const toolsRemoved = [...prevTools.keys()].filter((n) => !nowTools.has(n));
+  const toolsChanged = [...nowTools.keys()].filter((n) => prevTools.has(n)).map((n) => {
+    const a = prevTools.get(n);
+    const b = nowTools.get(n);
+    const description = (a.description ?? '') !== (b.description ?? '');
+    const schema = JSON.stringify(a.input_schema ?? null) !== JSON.stringify(b.input_schema ?? null);
+    return description || schema ? { name: n, description, schema } : null;
+  }).filter(Boolean);
+
+  // Order counts: the proxy sends the tools and the beta flags in the bundle's order.
+  const sameOrder = (a, b) => a.join('\n') === b.join('\n');
+  const prevToolNames = (prev.tools ?? []).map((t) => t.name);
+  const nowToolNames = (now.tools ?? []).map((t) => t.name);
+  const toolsReordered = !sameOrder(prevToolNames.filter((n) => nowTools.has(n)), nowToolNames.filter((n) => prevTools.has(n)));
+  // A tool differs in a way not broken down here when carrying the new
+  // description and input schema over to the old definition does not give the
+  // new definition. That holds whether or not its description also changed.
+  const toolsOther = nowToolNames.filter((n) => {
+    if (!prevTools.has(n)) return false;
+    const a = prevTools.get(n);
+    const b = nowTools.get(n);
+    return JSON.stringify({ ...a, description: b.description, input_schema: b.input_schema }) !== JSON.stringify(b);
+  });
+
+  const betaList = (t) => String(t.anthropic_beta ?? '').split(',').filter(Boolean);
+  const pb = new Set(betaList(prev));
+  const nb = new Set(betaList(now));
+  const betasReordered = !sameOrder([...pb].filter((b) => nb.has(b)), [...nb].filter((b) => pb.has(b)));
+
+  const ph = prev.header_values ?? {};
+  const nh = now.header_values ?? {};
+  const headerValues = [...new Set([...Object.keys(ph), ...Object.keys(nh)])].sort()
+    .filter((h) => !UNDESCRIBED_HEADER_VALUES.has(h.toLowerCase()) && ph[h] !== nh[h])
+    .map((h) => ({ name: h, before: ph[h] ?? null, after: nh[h] ?? null }));
+  const headerValuesHidden = [...new Set([...Object.keys(ph), ...Object.keys(nh)])]
+    .some((h) => UNDESCRIBED_HEADER_VALUES.has(h.toLowerCase()) && ph[h] !== nh[h]);
+
+  const prompt = (t) => t.system_prompt ?? '';
+  const change = {
+    version: { before: prev._version ?? null, after: now._version ?? null },
+    systemPrompt: prompt(prev) === prompt(now) ? null : { before: prompt(prev).length, after: prompt(now).length },
+    variants,
+    unchangedVariants: Object.keys(nv).filter((k) => (pv[k] ?? '') === nv[k]).sort(),
+    toolsAdded,
+    toolsRemoved,
+    toolsChanged,
+    toolsReordered,
+    betasAdded: [...nb].filter((b) => !pb.has(b)),
+    betasRemoved: [...pb].filter((b) => !nb.has(b)),
+    betasReordered,
+    headerValues,
+    headerOrder: JSON.stringify(prev.header_order ?? []) !== JSON.stringify(now.header_order ?? []),
+    bodyFieldOrder: JSON.stringify(prev.body_field_order ?? []) !== JSON.stringify(now.body_field_order ?? []),
+    agentIdentity: (prev.agent_identity ?? '') !== (now.agent_identity ?? ''),
+  };
+  // Whether what is recorded above accounts for a top-level key that differs.
+  // A key that differs with nothing recorded for it, or with a part that is not
+  // broken down, is named in `otherKeys`, as is any key not listed here.
+  const namesMoved = toolsAdded.length > 0 || toolsRemoved.length > 0 || toolsReordered;
+  const accountedFor = {
+    _version: change.version.before !== change.version.after,
+    system_prompt: change.systemPrompt !== null,
+    system_prompt_variants: variants.length > 0,
+    tools: toolsOther.length === 0 && (namesMoved || toolsChanged.length > 0),
+    tool_names: namesMoved,
+    anthropic_beta: change.betasAdded.length > 0 || change.betasRemoved.length > 0 || betasReordered,
+    header_values: headerValues.length > 0 && !headerValuesHidden,
+    header_order: change.headerOrder,
+    body_field_order: change.bodyFieldOrder,
+    agent_identity: change.agentIdentity,
+  };
+  change.otherKeys = meaningfulTemplateKeys(prev, now).filter((k) => !accountedFor[k]);
+  return change;
+}
+
+/** Names as code, joined the way a sentence lists them. */
+const sentenceList = (items) => (items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`);
+const code = (names) => sentenceList(names.map((n) => `\`${n}\``));
+const toolParts = (t) => (t.description && t.schema ? 'description and input schema' : t.description ? 'description' : 'input schema');
+
+/**
+ * The "What changes" list of a rebake PR: one bullet per thing that moved in
+ * the bundle, then one line naming what was compared and did not move.
+ */
+export function formatRebakeSummary(c) {
+  const lines = [];
+  for (const v of c.variants) {
+    const name = `${familyLabel(v.key)} system prompt`;
+    if (v.after === 0) lines.push(`- **${name}:** removed from the bundle. Requests for ${familyLabel(v.key)} models built from it carry the base prompt.`);
+    else if (v.before === 0) lines.push(`- **${name}:** new in the bundle, ${v.after} characters.`);
+    else lines.push(`- **${name}:** \`system_prompt_variants.${v.key}\` goes from ${v.before} to ${v.after} characters.`);
+  }
+  if (c.systemPrompt) lines.push(`- **Base system prompt:** goes from ${c.systemPrompt.before} to ${c.systemPrompt.after} characters.`);
+  if (c.agentIdentity) lines.push('- **Agent identity line:** changed.');
+  if (c.toolsAdded.length) lines.push(`- **Tools added:** ${code(c.toolsAdded)}.`);
+  if (c.toolsRemoved.length) lines.push(`- **Tools removed:** ${code(c.toolsRemoved)}.`);
+  for (const t of c.toolsChanged) lines.push(`- **\`${t.name}\` tool:** its ${toolParts(t)} changed.`);
+  if (c.toolsReordered) lines.push('- **Tool order:** changed.');
+  if (c.betasAdded.length) lines.push(`- **anthropic_beta:** adds ${code(c.betasAdded)}.`);
+  if (c.betasRemoved.length) lines.push(`- **anthropic_beta:** drops ${code(c.betasRemoved)}.`);
+  if (c.betasReordered) lines.push('- **anthropic_beta:** the flags both bundles hold are in another order.');
+  for (const h of c.headerValues) {
+    if (h.after === null) lines.push(`- **Header value \`${h.name}\`:** removed from the bundle (it held \`${h.before}\`).`);
+    else if (h.before === null) lines.push(`- **Header value \`${h.name}\`:** new in the bundle, \`${h.after}\`.`);
+    else lines.push(`- **Header value \`${h.name}\`:** goes from \`${h.before}\` to \`${h.after}\`.`);
+  }
+  if (c.headerOrder) lines.push('- **Header order:** changed.');
+  if (c.bodyFieldOrder) lines.push('- **Body field order:** changed.');
+  if (c.version.before !== c.version.after) lines.push(`- **Label:** \`_version\` goes from ${c.version.before} to ${c.version.after}.`);
+  if (c.otherKeys.length) lines.push(`- **Other fields:** ${code(c.otherKeys)} differ in a way not broken down here. See the diff of the bundle.`);
+
+  const same = [];
+  if (!c.systemPrompt) same.push('the base system prompt');
+  if (c.unchangedVariants.length) same.push(`the ${sentenceList(c.unchangedVariants.map(familyLabel))} prompt${c.unchangedVariants.length === 1 ? '' : 's'}`);
+  if (!c.toolsAdded.length && !c.toolsRemoved.length) same.push('the tool names');
+  if (!c.betasAdded.length && !c.betasRemoved.length && !c.betasReordered && !c.otherKeys.includes('anthropic_beta')) same.push('`anthropic_beta`');
+  if (!c.headerOrder) same.push('the header order');
+  if (same.length) lines.push(`- Unchanged: ${sentenceList(same)}.`);
+  return lines;
+}
+
+/**
+ * The release note of a rebake: one bullet per thing that moved in the bundle,
+ * and one for its label when that moved. Never empty: a bake that changed only
+ * fields this module does not break down names those fields.
+ */
+export function formatRebakeChangelog(c) {
+  const cc = c.version.after ? `Claude Code ${c.version.after}` : 'Claude Code';
+  const out = [];
+  for (const v of c.variants) {
+    const f = familyLabel(v.key);
+    if (v.after === 0) {
+      out.push(`- **The bundled template no longer holds a system prompt for ${f}.** Requests for ${f} models built from it carry the base prompt.`);
+    } else if (v.before === 0) {
+      out.push(`- **The bundled template holds a system prompt for ${f}.** It is ${v.after} characters, and requests for ${f} models built from the bundled template carry it in place of the base prompt.`);
+    } else {
+      out.push(`- **The bundled ${f} system prompt is the one captured from ${cc}.** It is ${v.after} characters; the bundle held a ${v.before}-character one. Requests for ${f} models built from the bundled template carry it.`);
+    }
+  }
+  if (c.systemPrompt) {
+    out.push(`- **The bundled base system prompt is the one captured from ${cc}.** It is ${c.systemPrompt.after} characters; the bundle held a ${c.systemPrompt.before}-character one.`);
+  }
+  if (c.agentIdentity) out.push(`- **The bundled agent identity line is the one captured from ${cc}.**`);
+  if (c.toolsAdded.length) out.push(`- **The bundled tool list gains ${code(c.toolsAdded)}.**`);
+  if (c.toolsRemoved.length) out.push(`- **The bundled tool list drops ${code(c.toolsRemoved)}.**`);
+  if (c.toolsChanged.length === 1) {
+    const t = c.toolsChanged[0];
+    out.push(`- **The bundled \`${t.name}\` tool definition changed.** Its ${toolParts(t)} moved with the capture from ${cc}.`);
+  } else if (c.toolsChanged.length > 1) {
+    out.push(`- **The bundled ${code(c.toolsChanged.map((t) => t.name))} tool definitions changed.** With the capture from ${cc}: ${sentenceList(c.toolsChanged.map((t) => `\`${t.name}\` (${toolParts(t)})`))}.`);
+  }
+  if (c.toolsReordered) out.push(`- **The bundled tool list is in the order captured from ${cc}.**`);
+  if (c.betasAdded.length) out.push(`- **The bundled \`anthropic_beta\` set gains ${code(c.betasAdded)}.**`);
+  if (c.betasRemoved.length) out.push(`- **The bundled \`anthropic_beta\` set drops ${code(c.betasRemoved)}.**`);
+  if (c.betasReordered) out.push(`- **The bundled \`anthropic_beta\` flags are in the order captured from ${cc}.**`);
+  // A user-agent whose value moved is the version label in another place, and
+  // is named with the label below.
+  const userAgent = c.headerValues.find((h) => h.name.toLowerCase() === 'user-agent' && h.before !== null && h.after !== null);
+  for (const h of c.headerValues) {
+    if (h === userAgent) continue;
+    if (h.after === null) out.push(`- **The bundle no longer holds a value for the \`${h.name}\` header.** It held \`${h.before}\`.`);
+    else if (h.before === null) out.push(`- **The bundle holds a value for the \`${h.name}\` header, \`${h.after}\`.**`);
+    else out.push(`- **The bundled \`${h.name}\` header value is \`${h.after}\`.** It was \`${h.before}\`.`);
+  }
+  if (c.headerOrder) out.push(`- **The bundled header order is the one captured from ${cc}.**`);
+  if (c.bodyFieldOrder) out.push(`- **The bundled body field order is the one captured from ${cc}.**`);
+  if (c.version.before !== c.version.after || userAgent) {
+    const was = c.version.before !== c.version.after && c.version.before ? ` It was labelled ${c.version.before}.` : '';
+    const agent = userAgent ? ` Its \`user-agent\` value is \`${userAgent.after}\`.` : '';
+    out.push(`- **The bundled template is labelled ${cc}.**${was}${agent}`);
+  }
+  if (c.otherKeys.length) {
+    out.push(`- **The bundle's ${code(c.otherKeys)} ${c.otherKeys.length === 1 ? 'field differs' : 'fields differ'}** in a way these notes do not break down.`);
+  }
+  if (out.length === 0) out.push('- **The bundled template was baked again** and reads the same in every field these notes cover.');
+  return out;
+}
+
+/**
+ * The `--check` summary when only prompt variants drifted. It says what the
+ * slot check compared and found equal, and what it does not compare at all.
+ */
+export function formatVariantOnlySummary(variantDiffs) {
+  return [
+    '**Verdict:** 🟡 Moderate: verify that requests rebuilt from the bundled template are still accepted upstream with the change below',
+    '',
+    ...variantDiffs.map((v) => `- **system_prompt_variants.${v.key}:** from ${v.before} to ${v.after} chars`),
+    '- The base system prompt, the tools (names, descriptions, input schemas and order), the `anthropic_beta` flags the bundle keeps, the header order and the header values the proxy replays match. The beta flags the proxy manages per request and the version in the user-agent are not compared by this check.',
+  ];
+}
+
+/**
+ * What the watcher does with an open rebake PR.
+ *
+ * `prChecks` are the exit codes of `capture-and-bake.mjs --check` run against
+ * the PR's bundle, in order: 0 or 3 the bundle matches live, 2 it has drifted,
+ * anything else the check could not tell. `masterCheck` is the same check
+ * against master's bundle. `residue` is true when a check of the PR's bundle
+ * hit the dario#881 tripwire, an intermittent capture anomaly.
+ *
+ *   keep     the PR is young, or its bundle matches live, or the evidence is
+ *            not good enough to close on
+ *   replace  the PR's bundle has drifted and so has master's: close the PR and
+ *            bake again
+ *   close    the PR's bundle has drifted and live matches master again: close
+ *            the PR, there is nothing to bake
+ *
+ * Closing takes two captures that both report drift: a single capture can be
+ * an A/B arm or the #881 residue. Opening a rebake PR takes two captures as
+ * well, a check that reports drift and then a bake that differs from the
+ * committed bundle.
+ */
+export function rebakePrAction({ ageHours, staleAfterHours, prChecks, masterCheck, residue = false }) {
+  if (!(ageHours >= staleAfterHours)) return 'keep';
+  if (residue) return 'keep';
+  if (!Array.isArray(prChecks) || prChecks.length < 2 || !prChecks.every((c) => c === 2)) return 'keep';
+  return masterCheck === 2 ? 'replace' : 'close';
+}

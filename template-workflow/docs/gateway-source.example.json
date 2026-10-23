@@ -1,0 +1,9 @@
+{
+  "capture_run_id": "REPLACE_WITH_ACTUAL_CAPTURE_RUN_ID",
+  "environment_id": "REPLACE_WITH_ACTUAL_CAPTURE_ENVIRONMENT",
+  "scene_revision": "REPLACE_WITH_ACTUAL_SCENE_REVISION",
+  "comparison_context_id": "REPLACE_WITH_ACTUAL_COMPARISON_CONTEXT",
+  "source_sequence": "1",
+  "cc_version": "REPLACE_WITH_CAPTURED_CC_VERSION",
+  "dario_commit": "15d269e3b49c681c1ab3e53af2e5181f01c71619"
+}

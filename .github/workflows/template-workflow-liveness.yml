@@ -1,0 +1,31 @@
+name: Template Workflow liveness
+on:
+  schedule:
+    - cron: '17 */2 * * *'
+  workflow_dispatch:
+defaults:
+  run:
+    shell: bash
+    working-directory: template-workflow
+env:
+  TEMPLATE_CAPTURE_WORKFLOW: template-workflow-capture.yml
+  TEMPLATE_CI_WORKFLOW: template-workflow-ci.yml
+permissions:
+  contents: read
+jobs:
+  liveness:
+    if: github.repository == 'models-one/dario' && (github.event_name == 'workflow_dispatch' || vars.TEMPLATE_CAPTURE_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - run: node scripts/automation.mjs liveness

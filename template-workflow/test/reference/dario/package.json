@@ -1,0 +1,94 @@
+{
+  "name": "@askalf/dario",
+  "version": "6.13.30",
+  "description": "Use your Claude and ChatGPT subscriptions in Cursor, Cline, Aider, Claude Code and the Agent SDK — at subscription pricing, not per-token API bills. One local Anthropic + OpenAI-compatible endpoint: either plan answers either wire shape, with automatic failover when one hits its limit.",
+  "type": "module",
+  "bin": {
+    "dario": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "docs",
+    "!docs/recovery.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && cp src/cc-template-data.json dist/",
+    "test": "node --test test/all.test.mjs",
+    "test:serial": "node test/issue-29-tool-translation.mjs && node test/hybrid-tools.mjs && node test/tool-schema-contract.mjs && node test/scrub-paths.mjs && node test/provider-prefix.mjs && node test/analytics-recording.mjs && node test/analytics-billing-bucket.mjs && node test/failover-429.mjs && node test/pool-sticky.mjs && node test/live-fingerprint.mjs && node test/proxy-header-order.mjs && node test/proxy-body-order.mjs && node test/runtime-fingerprint.mjs && node test/pacing.mjs && node test/stream-drain.mjs && node test/subagent.mjs && node test/mcp-protocol.mjs && node test/mcp-tools.mjs && node test/mcp-e2e.mjs && node test/session-rotation.mjs && node test/drift-detection.mjs && node test/cc-authorize-probe-classifier.mjs && node test/compat-range.mjs && node test/doctor-formatter.mjs && node test/doctor-identity-drift.mjs && node test/doctor-oauth-pool.mjs && node test/atomic-write.mjs && node test/account-refresh-singleflight.mjs && node test/durable-token-persist.mjs && node test/streaming-edge-cases.mjs && node test/client-detection.mjs && node test/manual-oauth-flow.mjs && node test/scrub-template.mjs && node test/context-bleed.mjs && node test/passthrough-header-forwarding.mjs && node test/capture-provenance.mjs && node test/sanitize-messages.mjs && node test/platform-tools.mjs && node test/strict-template-flags.mjs && node test/request-queue.mjs && node test/effort-flag.mjs && node test/template-invariants.mjs",
+    "audit": "npm audit --production --audit-level=high",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "e2e": "node test/e2e.mjs",
+    "stress": "node test/stress.mjs",
+    "compat": "node test/compat.mjs",
+    "test:refresh-lock-race": "node test/integration/dual-instance-race.mjs",
+    "lint:pkg": "node scripts/check-package-json.mjs",
+    "preflight": "node scripts/preflight.mjs",
+    "drift:sdk": "node scripts/check-sdk-drift.mjs",
+    "drift:wire": "node scripts/check-wire-drift.mjs",
+    "check:overage": "node scripts/check-overage-live.mjs",
+    "cch:calibrate": "node scripts/cch-calibrate.mjs",
+    "fix:pkg": "node -e \"const fs=require('fs');fs.writeFileSync('package.json',JSON.stringify(JSON.parse(fs.readFileSync('package.json','utf-8')),null,2)+'\\n')\"",
+    "audit:tui": "node tools/tui-audit/audit.mjs",
+    "readme:assets": "node scripts/readme/terminal.mjs && node scripts/readme/tui.mjs",
+    "check:readme": "node scripts/check-readme-line-count.mjs && node scripts/check-readme-links.mjs",
+    "bench": "node scripts/bench-overhead.mjs"
+  },
+  "keywords": [
+    "llm",
+    "llm-router",
+    "llm-proxy",
+    "multi-provider",
+    "openai-compat",
+    "openai",
+    "chatgpt",
+    "codex",
+    "claude",
+    "anthropic",
+    "claude-code",
+    "claude-max",
+    "claude-pro",
+    "subscription",
+    "oauth",
+    "proxy",
+    "cursor",
+    "cline",
+    "aider",
+    "agent-sdk",
+    "openrouter",
+    "litellm",
+    "ollama",
+    "groq",
+    "cli",
+    "developer-tools"
+  ],
+  "author": "askalf (https://github.com/askalf)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/askalf/dario.git"
+  },
+  "homepage": "https://github.com/askalf/dario",
+  "bugs": {
+    "url": "https://github.com/askalf/dario/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.0"
+  }
+}

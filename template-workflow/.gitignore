@@ -1,0 +1,14 @@
+node_modules/
+dist/
+artifacts/
+.env
+.env.*
+!.env.example
+*.log
+*-output.txt
+drift-summary.md
+rebake-summary.md
+label-target.txt
+issue-881-tripwire.txt
+drift-report.json
+*.credentials.json
