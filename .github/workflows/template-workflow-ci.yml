@@ -37,9 +37,3 @@ jobs:
       - run: npm run verify:upstream
       - run: npm test
       - run: npm run verify
-      - run: npm run export
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: template-node-${{ matrix.node }}
-          path: template-workflow/artifacts/official/
-          if-no-files-found: error

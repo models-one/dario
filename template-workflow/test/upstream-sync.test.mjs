@@ -20,13 +20,16 @@ function fixture(t) {
   upstream.set('package-lock.json', readFileSync(join(root, 'package-lock.json')));
   return { directory, upstream, manifest };
 }
-test('upstream source and exact reference update together, keeping local package commands', (t) => {
+test('upstream implementation and test fixtures update without replacing our produced baseline', (t) => {
   const { directory, upstream } = fixture(t);
   const before = JSON.parse(readFileSync(join(directory, 'package.json')));
+  mkdirSync(join(directory, 'src'));
+  writeFileSync(join(directory, 'src/cc-template-data.json'), 'our independently produced baseline');
+  writeFileSync(join(directory, 'src/cc-template-provenance.json'), 'our capture evidence');
   const result = planUpstreamSync({ root: directory, commit: 'a'.repeat(40), readUpstream: (name) => { if (!upstream.has(name)) throw new Error(`missing fixture ${name}`); return upstream.get(name); } });
   assert.equal(result.changed, true);
-  assert.equal(result.files.has('reference/cc-template-data.json'), true);
-  assert.deepEqual(result.files.get('reference/cc-template-data.json'), upstream.get('src/cc-template-data.json'));
+  for (const name of ['reference/cc-template-data.json', 'src/cc-template-data.json', 'src/cc-template-provenance.json']) assert.equal(result.files.has(name), false);
+  assert.deepEqual(result.files.get('test/reference/dario/src/cc-template-data.json'), upstream.get('src/cc-template-data.json'));
   const pkg = JSON.parse(result.files.get('package.json'));
   assert.equal(pkg.scripts.capture, before.scripts.capture);
   assert.notEqual(pkg.version, before.version);
@@ -35,7 +38,10 @@ test('upstream source and exact reference update together, keeping local package
   applyUpstreamSync(directory, result);
   const after = JSON.parse(readFileSync(join(directory, 'upstream-snapshot.json')));
   assert.equal(after.commit, 'a'.repeat(40));
-  assert.equal(after.officialTemplate.sha256, after.files['src/cc-template-data.json'].source_sha256);
+  assert.equal(after.officialTemplate, undefined);
+  assert.equal(after.files['src/cc-template-data.json'], undefined);
+  assert.equal(readFileSync(join(directory, 'src/cc-template-data.json'), 'utf8'), 'our independently produced baseline');
+  assert.equal(readFileSync(join(directory, 'src/cc-template-provenance.json'), 'utf8'), 'our capture evidence');
   assert.match(readFileSync(join(directory, 'scripts/capture-and-bake.mjs'), 'utf8'), /DEFERRED_TOOLS/);
   assert.match(readFileSync(join(directory, 'CHANGELOG.md'), 'utf8'), /Sync Dario aaaaaaaaaaaa/);
 });

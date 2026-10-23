@@ -1,6 +1,6 @@
 {
   "name": "template-workflow",
-  "version": "0.2.1",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "Standalone Dario Claude Code template capture, scrub, drift detection and automation",
@@ -24,7 +24,7 @@
     "verify:upstream": "node scripts/verify-upstream.mjs",
     "sync:upstream": "node scripts/sync-upstream.mjs",
     "prepare:claude": "node bin/template-workflow.mjs prepare-claude",
-    "verify:parity": "node scripts/verify-parity.mjs"
+    "produce": "node bin/template-workflow.mjs produce"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

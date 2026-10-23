@@ -1,12 +1,6 @@
 {
   "repository": "askalf/dario",
-  "commit": "15d269e3b49c681c1ab3e53af2e5181f01c71619",
-  "officialTemplate": {
-    "path": "reference/cc-template-data.json",
-    "ccVersion": "2.1.306",
-    "bytes": 163943,
-    "sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f"
-  },
+  "commit": "0a4a7bc6cda6e0ab9fbba250d3d50fa273c6a4cc",
   "files": {
     "LICENSE": {
       "source_path": "LICENSE",
@@ -39,12 +33,6 @@
       "source_path": "src/cch.ts",
       "source_sha256": "3e218212ab7aeef5af31ecaa2fd90ecae8922a2208e114714a3d78ab6ba8b8cc",
       "local_sha256": "3e218212ab7aeef5af31ecaa2fd90ecae8922a2208e114714a3d78ab6ba8b8cc"
-    },
-    "src/cc-template-data.json": {
-      "source_path": "src/cc-template-data.json",
-      "source_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f",
-      "local_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f",
-      "mutable": "local observation baseline; official delivery uses reference/cc-template-data.json"
     },
     "scripts/capture-and-bake.mjs": {
       "source_path": "scripts/capture-and-bake.mjs",
@@ -144,15 +132,10 @@
       "source_sha256": "7be03dc6c7727ae40b6787cf97bf0394dfb5836d159ae63d29f0f6e68087236e",
       "local_sha256": "7be03dc6c7727ae40b6787cf97bf0394dfb5836d159ae63d29f0f6e68087236e"
     },
-    "reference/cc-template-data.json": {
-      "source_path": "src/cc-template-data.json",
-      "source_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f",
-      "local_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f"
-    },
     "test/reference/dario/package.json": {
       "source_path": "package.json",
-      "source_sha256": "41196c15dcce4d52cf73afd1f1c5e40bcd2d04ea07c6a846d454dc10ca1ee35f",
-      "local_sha256": "41196c15dcce4d52cf73afd1f1c5e40bcd2d04ea07c6a846d454dc10ca1ee35f"
+      "source_sha256": "a346add78cf18ae6a9dfb1f287d4f98f396f8ae855992daef69d6c8e0d3a38c8",
+      "local_sha256": "a346add78cf18ae6a9dfb1f287d4f98f396f8ae855992daef69d6c8e0d3a38c8"
     },
     "test/reference/dario/tsconfig.json": {
       "source_path": "tsconfig.json",
@@ -181,8 +164,8 @@
     },
     "test/reference/dario/src/cc-template-data.json": {
       "source_path": "src/cc-template-data.json",
-      "source_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f",
-      "local_sha256": "f31a7d43eb821ead935deb3fd619aafe60512238d4556b752185a7c879132a5f"
+      "source_sha256": "05987f9f37f037ce80d23bf6541417950abc7698f9f0f31ee1efa2592b9eafa7",
+      "local_sha256": "05987f9f37f037ce80d23bf6541417950abc7698f9f0f31ee1efa2592b9eafa7"
     },
     "test/reference/dario/scripts/capture-and-bake.mjs": {
       "source_path": "scripts/capture-and-bake.mjs",

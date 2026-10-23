@@ -1,3 +1,5 @@
+> Historical development record. Production now publishes our own captured template from `artifacts/latest/` with provenance. The previous official-snapshot delivery design described below has been removed; see ../README.md.
+
 # 提取边界
 
 当前固定来源：`askalf/dario` 提交 `15d269e3b49c681c1ab3e53af2e5181f01c71619`。来源锁是实际版本的依据，定时 upstream-sync 可通过测试后的 PR 更新它。

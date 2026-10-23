@@ -1,3 +1,5 @@
+> Historical development record. Production now publishes our own captured template from `artifacts/latest/` with provenance. The previous official-snapshot delivery design described below has been removed; see ../README.md.
+
 # 运行与一致性验证
 
 日期：2026-10-23。

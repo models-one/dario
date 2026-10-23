@@ -14,7 +14,7 @@ permissions:
   contents: read
 jobs:
   liveness:
-    if: github.repository == 'models-one/dario' && (github.event_name == 'workflow_dispatch' || vars.TEMPLATE_CAPTURE_ENABLED == 'true')
+    if: github.repository == 'models-one/dario'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

@@ -24,7 +24,7 @@ test('bake content and release notes compare the nested producer baseline, not p
   const module = join(repo, 'template-workflow');
   for (const directory of [join(repo, 'src'), join(module, 'src'), join(module, 'scripts')]) mkdirSync(directory, { recursive: true });
   for (const name of ['scripts/check-rebake-content.mjs', 'scripts/rebake-release-prep.mjs', 'scripts/drift-report.mjs', 'scripts/_drift-patch-helpers.mjs', 'package.json', 'package-lock.json', 'CHANGELOG.md']) copyFileSync(join(root, name), join(module, name));
-  const baseline = JSON.parse(readFileSync(join(root, 'reference/cc-template-data.json')));
+  const baseline = JSON.parse(readFileSync(join(root, 'test/fixtures/seed-template.json')));
   const parent = structuredClone(baseline); parent.system_prompt = 'PARENT MUST NOT BE THE BASELINE';
   writeFileSync(join(repo, 'src/cc-template-data.json'), JSON.stringify(parent));
   writeFileSync(join(module, 'src/cc-template-data.json'), JSON.stringify(baseline));

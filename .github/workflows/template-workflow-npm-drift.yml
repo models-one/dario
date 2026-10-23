@@ -27,6 +27,7 @@ jobs:
       pull-requests: write
     env:
       GH_TOKEN: ${{ secrets.CC_DRIFT_BOT_PAT || secrets.GITHUB_TOKEN }}
+      TEMPLATE_PR_UPDATES_ENABLED: ${{ secrets.CC_DRIFT_BOT_PAT != '' }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       TEMPLATE_AUTO_MERGE: ${{ vars.TEMPLATE_AUTO_MERGE }}
     steps:

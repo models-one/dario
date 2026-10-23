@@ -1,61 +1,37 @@
-# Standalone template workflow
+# Template producer workflows
 
-The producer lives in `template-workflow/`. It has its own package, lockfile,
-source lock, capture CLI and tests. The parent Dario application remains at the
-repository root.
+The producer lives in `template-workflow/`. Its build, dependencies and source lock are separate from the parent Dario application.
+
+## Production path
+
+The scheduled capture workflow calls the release workflow on a GitHub-hosted Ubuntu runner. Every run resolves npm latest once, verifies the native Claude Code client, performs Dario's multi-model capture against a local collector, scrubs and merges tools, detects drift, then rebakes or synchronizes labels as needed. It validates and publishes our generated template.
+
+Production reads our last published release as its baseline. It never exports an official Dario snapshot. The upstream synchronization job updates implementation code and development fixtures without touching the production baseline.
+
+Published files: `cc-template-data.json`, `metadata.json`, `provenance.json`, `SHA256SUMS`. Their release tag is `template-cc-<version>-<digest>`. The provenance identifies the client binary, baseline digest and capture run. Failed capture, invalid provenance, unexpected tool loss or a version mismatch stops publication.
+
+The initial migration baseline is only an input to tool preservation. If it has no production provenance, a fresh capture and bake are mandatory before export. Development fixtures are not publishable artifacts.
+
+## Workflows
+
+- `ci`: Node 22/24 build and regression checks.
+- `capture`: hourly at :41; calls production/release.
+- `release`: capture latest, validate and publish on changes or manual dispatch.
+- `npm-drift`: hourly at :00; checks npm and dispatches production on drift.
+- `liveness`: every two hours; checks the capture workflow.
+- `upstream-sync`: hourly at :23; tests implementation updates and prepares an optional maintenance PR.
+
+Only this repository (`models-one/dario`) enables the operational schedules. Hosted capture uses a placeholder API key and the local loopback collector; it needs no self-hosted runner or Claude account credentials. The production workflow declares Contents write permission for `GITHUB_TOKEN`.
+
+Maintenance PRs require an organization-approved `CC_DRIFT_BOT_PAT`; without it, source updates are reported as issues and normal template production continues independently. Optional auto-merge uses `TEMPLATE_AUTO_MERGE=true`.
+
+## Local production
 
 ```sh
 cd template-workflow
 npm ci --ignore-scripts --no-audit --no-fund
 npm run build
-npm test
-npm run export
+npm run produce
 ```
 
-The official template is exported to
-`template-workflow/artifacts/official/cc-template-data.json`. Its bytes and
-SHA-256 must match the pinned `askalf/dario` reference. Local capture uses the
-verified npm latest client and exports observations only with `--observed`.
-See the [producer README](../template-workflow/README.md) for capture options.
-
-## Repository workflows
-
-The active workflows are under the repository-root `.github/workflows/` and
-have the `template-workflow-` filename prefix:
-
-- `ci`: Node 22/24 build, upstream source verification, original Dario tests,
-  bake parity, runtime and nested repository tests, official artifact upload.
-- `release`: build and verify the official artifact, then publish a
-  `template-workflow-v<version>` release. Tags are separate from Dario releases.
-- `upstream-sync`: inspect upstream hourly at :23 and open a tested sync PR.
-- `npm-drift`: inspect Claude Code npm releases hourly at :00.
-- `capture`: capture and rebake observations hourly at :41 on a dedicated Linux
-  runner. It also handles label-only drift and stale rebake PRs.
-- `liveness`: monitor the capture workflow every two hours.
-
-CI runs on changes to the producer or its workflows, and supports manual
-`workflow_dispatch`. Operational jobs target this repository explicitly, so
-fork status does not silently disable the configured workflows.
-
-## Live capture setup
-
-Register a Linux self-hosted runner with the label `template-workflow`, install
-Node/npm/Git/tar/gh, and prepare a usable Claude login for that runner account.
-Set `TEMPLATE_RUNNER_LABEL` if the label differs. Once ready, set
-`TEMPLATE_CAPTURE_ENABLED=true` to enable scheduled capture and its liveness
-monitor. A manual dispatch is an explicit request to run even before that flag
-is set.
-
-Other supported variables: `TEMPLATE_HTTP_PROXY`, `TEMPLATE_CC_CACHE_DIR`,
-`TEMPLATE_CC_VERSION` and `TEMPLATE_CLAUDE_BIN`. Default client selection is
-latest; fixed client overrides still have to match the requested version.
-
-The maintenance jobs require Contents, Issues, Pull requests and Actions
-permissions as declared in their workflows. The repository must allow Actions
-to create PRs when using GITHUB_TOKEN. `CC_DRIFT_BOT_PAT` is optional. After
-creating a bot PR, the maintenance job explicitly dispatches producer CI for
-that branch. Auto-merge is opt-in via `TEMPLATE_AUTO_MERGE=true` and the
-repository's branch protection/auto-merge settings.
-
-No test credentials are needed for the hosted build or producer regression
-suite. A passing hosted build does not mean a live capture runner is registered.
+Production requires Linux and uses npm latest. Exported files appear under `artifacts/latest/`. For local proxy downloads set `TEMPLATE_HTTP_PROXY=http://127.0.0.1:7897`. See the producer README for explicit development overrides and Gateway bundle export.

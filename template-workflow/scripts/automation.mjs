@@ -116,14 +116,14 @@ export async function templateWatch() {
     const t = JSON.parse(after);
     const labels = ['cc-drift-template'];
     if (tripwire || existsSync(join(root, 'issue-881-tripwire.txt'))) labels.push('issue-881-residue');
-    publishPR({ branch: `bot/template-rebake-${t._version}-${process.env.GITHUB_RUN_ID || Date.now()}`, title: `chore(template): rebake CC ${t._version} (${version})`, body: `Fresh capture, original Dario scrub and bake, schema 3 artifact verification, and producer tests.\n\n${read('rebake-summary.md')}\n\n${runURL}`, labels, files: ['src/cc-template-data.json', 'package.json', 'package-lock.json', 'CHANGELOG.md'] });
+    publishPR({ branch: `bot/template-rebake-${t._version}-${process.env.GITHUB_RUN_ID || Date.now()}`, title: `chore(template): rebake CC ${t._version} (${version})`, body: `Fresh capture, original Dario scrub and bake, schema 3 artifact verification, and producer tests.\n\n${read('rebake-summary.md')}\n\n${runURL}`, labels, files: ['src/cc-template-data.json', 'src/cc-template-provenance.json', 'package.json', 'package-lock.json', 'CHANGELOG.md'] });
   } else {
     if (prs('bot/template-label-').length) { console.log('Label-sync PR already open.'); return; }
     const target = read('label-target.txt').toString().trim();
-    const version = checkedNode('scripts/label-sync.mjs', target);
+    const version = checkedNode('bin/template-workflow.mjs', 'label-sync', target);
     checkedNode('bin/template-workflow.mjs', 'verify');
     run('npm', ['run', 'build']); run('npm', ['test']);
-    publishPR({ branch: `bot/template-label-${target}-${process.env.GITHUB_RUN_ID || Date.now()}`, title: `chore(template): sync CC label ${target} (${version})`, body: `Live wire-shape check matched. Only upstream's version labels and release metadata are updated.\n\n${runURL}`, labels: ['cc-drift-template'], files: ['src/cc-template-data.json', 'package.json', 'package-lock.json', 'CHANGELOG.md'] });
+    publishPR({ branch: `bot/template-label-${target}-${process.env.GITHUB_RUN_ID || Date.now()}`, title: `chore(template): sync CC label ${target} (${version})`, body: `Live wire-shape check matched. Only upstream's version labels and release metadata are updated.\n\n${runURL}`, labels: ['cc-drift-template'], files: ['src/cc-template-data.json', 'src/cc-template-provenance.json', 'package.json', 'package-lock.json', 'CHANGELOG.md'] });
   }
 }
 
@@ -136,6 +136,8 @@ export function npmWatch() {
   if (r.code === 0) { issue('cc-drift', 'Claude Code npm drift', `npm drift resolved. ${runURL}`, true); return; }
   if (!report.ccVersion || !Array.isArray(report.items)) throw new Error('npm scanner failed before obtaining a valid comparison');
   issue('cc-drift', `Claude Code npm drift: ${report.ccVersion}`, `${report.items.map((i) => `- ${i.category}: ${i.message}`).join('\n')}\n\n${runURL}`);
+  gh('workflow', 'run', captureWorkflow, '--ref', base);
+  if (process.env.TEMPLATE_PR_UPDATES_ENABLED !== 'true') { console.log('Capture dispatched. Compatibility PR updates require an approved bot token.'); return; }
   const branch = `bot/cc-drift-v${report.ccVersion}`;
   if (prs(branch).some((p) => p.headRefName === branch)) return;
   const result = JSON.parse(checkedNode('scripts/auto-draft-drift-fix.mjs', join(root, 'drift-report.json')));
@@ -152,8 +154,8 @@ export function upstreamWatch() {
   if (prs(branch).some((p) => p.headRefName === branch)) return;
   run('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund']);
   run('npm', ['run', 'build']); run('npm', ['run', 'verify:upstream']); run('npm', ['test']);
-  checkedNode('bin/template-workflow.mjs', 'export');
-  publishPR({ branch, title: `chore(upstream): sync Dario ${result.commit.slice(0, 12)}`, body: `Update the capture implementation, original reference tests and official CC ${result.ccVersion} template from the same Dario commit. Producer tests include byte-for-byte replay parity and official export integrity.\n\n${runURL}`, labels: ['dario-upstream'], files: result.changedFiles });
+  if (process.env.TEMPLATE_PR_UPDATES_ENABLED !== 'true') { issue('dario-upstream', 'Dario capture implementation update available', `Prepared and tested Dario ${result.commit}. Configure an approved bot token to open its source update PR.\n\n${runURL}`); return; }
+  publishPR({ branch, title: `chore(upstream): sync Dario ${result.commit.slice(0, 12)}`, body: `Update the capture implementation and development fixtures from one Dario commit. The producer baseline and published templates are preserved.\n\n${runURL}`, labels: ['dario-upstream'], files: result.changedFiles });
 }
 
 export function liveness() {
@@ -162,7 +164,7 @@ export function liveness() {
   const success = runs.find((r) => r.conclusion === 'success');
   const age = success ? (Date.now() - Date.parse(success.created_at)) / 3600000 : Infinity;
   if (age <= 8) { issue('cc-watcher-liveness', 'Template watcher is inactive', `Template watcher is healthy. ${runURL}`, true); return; }
-  issue('cc-watcher-liveness', 'Template watcher is inactive', `No successful template check within 8 hours. Check the self-hosted runner, Claude install and its login. ${runURL}`);
+  issue('cc-watcher-liveness', 'Template watcher is inactive', `No successful template check within 8 hours. Check the hosted capture/release run and npm client preparation. ${runURL}`);
   if (!runs.some((r) => ['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(r.status))) gh('workflow', 'run', captureWorkflow, '--ref', base);
   throw new Error('Template watcher has no recent successful run');
 }

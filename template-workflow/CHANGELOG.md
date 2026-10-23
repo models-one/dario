@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Publish our own latest-client captures with validated provenance; production no longer exports or compares an official Dario snapshot.
+- Run capture and release on hosted Linux, restore only our produced baselines, and keep source synchronization separate from production data.
+
+## [0.3.1] - 2026-10-23
+
+- Sync Dario 0a4a7bc6cda6 implementation and development fixtures; preserve the producer baseline.
+
 ## [0.2.1] - 2026-10-23
 
 - Integrate the standalone producer into models-one/dario with repository-root Actions and module-relative Git baselines.

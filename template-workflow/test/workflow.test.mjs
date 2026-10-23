@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { cpSync, readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync, mkdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -24,7 +24,7 @@ test('export preserves the original artifact bytes and Gateway bundle digest', (
   assert.equal(JSON.parse(makeBundle(seed, source(template))).source.cc_version, template._version);
   exportTemplate({ templatePath: input, out: result.directory });
   assert.equal(existsSync(join(result.directory, 'cc-template-bundle.json')), false);
-  assert.throws(() => exportTemplate({ templatePath: input, out: join(out, 'false-official'), origin: { type: 'dario-official', reference_sha256: '0'.repeat(64), byte_identical: true } }), /reference digest/);
+  assert.throws(() => exportTemplate({ templatePath: input, out: join(out, 'false-official'), origin: { type: 'dario-official', reference_sha256: '0'.repeat(64), byte_identical: true } }), /not supported/);
   assert.equal(existsSync(join(out, 'false-official')), false);
 });
 
@@ -61,19 +61,26 @@ test('real CLI capture/check/label/export chain with a controlled Claude process
   assert.match(baked.system_prompt, /A new canonical instruction\./); assert.equal(baked._source, 'bundled');
   assert.deepEqual(baked.tool_names, baked.tools.map((tool) => tool.name));
   const stamp = baked._captured;
-  r = cli(['label-sync', '2.1.297']); assert.equal(r.status, 0, r.stderr);
+  r = cli(['check'], { TEMPLATE_TEST_VERSION: '2.1.297', TEMPLATE_TEST_MUTATION: 'shape' }); assert.equal(r.status, 3, r.stderr);
+  r = cli(['label-sync', '2.1.297'], { TEMPLATE_TEST_VERSION: '2.1.297' }); assert.equal(r.status, 0, r.stderr);
   const labelled = JSON.parse(readFileSync(join(work, 'src/cc-template-data.json')));
   assert.equal(labelled._version, '2.1.297'); assert.equal(labelled._captured, stamp); assert.deepEqual(labelled.tools, baked.tools);
   assert.equal(JSON.parse(readFileSync(join(work, 'package.json'))).version, JSON.parse(readFileSync(join(work, 'package-lock.json'))).version);
   r = cli(['export', '--observed', '--out', join(work, 'artifacts')]); assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(readFileSync(join(work, 'artifacts/cc-template-data.json')), readFileSync(join(work, 'src/cc-template-data.json')));
-  r = cli(['export', '--out', join(work, 'official-output')]); assert.equal(r.status, 0, r.stderr);
-  assert.deepEqual(readFileSync(join(work, 'official-output/cc-template-data.json')), readFileSync(join(work, 'reference/cc-template-data.json')));
-  assert.equal(JSON.parse(readFileSync(join(work, 'official-output/metadata.json'))).origin.type, 'dario-official');
+  r = cli(['export', '--out', join(work, 'default-output')]); assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(readFileSync(join(work, 'default-output/cc-template-data.json')), readFileSync(join(work, 'src/cc-template-data.json')));
+  assert.equal(JSON.parse(readFileSync(join(work, 'default-output/metadata.json'))).origin.type, 'template-workflow');
+  assert.equal(JSON.parse(readFileSync(join(work, 'default-output/provenance.json'))).operation, 'label-sync');
   r = cli(['export', '--template', join(work, 'src/cc-template-data.json')]); assert.equal(r.status, 1);
-  writeFileSync(join(work, 'reference/cc-template-data.json'), Buffer.from('tampered'));
+  mkdirSync(join(work, 'reference'), { recursive: true });
+  writeFileSync(join(work, 'reference/cc-template-data.json'), Buffer.from('an unrelated broken official snapshot'));
+  r = cli(['export', '--out', join(work, 'independent-output')]); assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(readFileSync(join(work, 'independent-output/cc-template-data.json')), readFileSync(join(work, 'src/cc-template-data.json')));
+  rmSync(join(work, 'src/cc-template-provenance.json'));
   r = cli(['export', '--out', join(work, 'rejected-export')]); assert.equal(r.status, 1);
   assert.equal(existsSync(join(work, 'rejected-export')), false);
+
 });
 
 test('stale rebake is closed only after two drift captures; original baseline and outputs are restored', async (t) => {

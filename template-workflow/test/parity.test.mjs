@@ -11,9 +11,8 @@ import * as localScrub from '../dist/scrub-template.js';
 import * as officialScrub from './reference/dario/dist/scrub-template.js';
 import * as localDrift from '../scripts/drift-report.mjs';
 import * as officialDrift from './reference/dario/scripts/drift-report.mjs';
-import { readOfficialReference } from '../lib/official.mjs';
 const root = url.fileURLToPath(new URL('../', import.meta.url));
-const canonical = JSON.parse(readFileSync(new URL('../reference/cc-template-data.json', import.meta.url)));
+const canonical = JSON.parse(readFileSync(new URL('./reference/dario/src/cc-template-data.json', import.meta.url)));
 const historical = JSON.parse(readFileSync(new URL('./fixtures/seed-template.json', import.meta.url)));
 const observedNames = ['Agent', 'Bash', 'Edit', 'ListAgents', 'Read', 'ReportFindings', 'ScheduleWakeup', 'Skill', 'ToolSearch', 'Workflow', 'DeferredToolPlaceholder', 'Write'];
 const observed = canonical.tools.filter((t) => observedNames.includes(t.name));
@@ -117,17 +116,3 @@ for (const [name, options, expectedCode] of [
     }
   });
 }
-
-test('official delivery is exactly the upstream snapshot, including its capture timestamp', () => {
-  const official = readOfficialReference(root);
-  const upstreamBytes = readFileSync(new URL('./reference/dario/src/cc-template-data.json', import.meta.url));
-  assert.deepEqual(official.raw, upstreamBytes);
-  assert.equal(official.template._captured, JSON.parse(upstreamBytes)._captured);
-});
-
-test('CLI parity command reports actual byte equality and preserves its exit status', () => {
-  const r = spawnSync(process.execPath, [path.join(root, 'bin/template-workflow.mjs'), 'verify-parity'], { encoding: 'utf8' });
-  const same = readFileSync(path.join(root, 'src/cc-template-data.json')).equals(readFileSync(path.join(root, 'reference/cc-template-data.json')));
-  assert.equal(r.status, same ? 0 : 2, r.stderr);
-  assert.equal(JSON.parse(r.stdout).byte_identical, same);
-});

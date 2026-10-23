@@ -4,8 +4,6 @@ All notable changes to this project will be documented in this file.
 
 <!--
 Release convention: land changes under `## [Unreleased]`. At release
-
-- Add the standalone template producer under `template-workflow/`, with official-byte exports, capture parity tests and dedicated Actions workflows.
 time, rename that heading to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh
 `## [Unreleased]` above it. See CONTRIBUTING for the full release
 checklist. A bump leaves `## [Unreleased]` empty, notes merged while the
@@ -14,6 +12,9 @@ and CI fails a bump that strands one.
 -->
 
 ## [Unreleased]
+
+- Add the standalone template producer under `template-workflow/`, with capture regression tests and dedicated Actions workflows.
+- Publish independently captured latest-Claude-Code templates with provenance on hosted Linux.
 
 ## [6.13.30] - 2026-10-22
 

@@ -3,46 +3,57 @@ on:
   push:
     branches: [master]
     paths:
-      - template-workflow/reference/cc-template-data.json
-      - template-workflow/upstream-snapshot.json
-      - .github/workflows/template-workflow-release.yml
+      - 'template-workflow/**'
+      - '.github/workflows/template-workflow-release.yml'
+      - '.github/workflows/template-workflow-capture.yml'
   workflow_dispatch:
-defaults:
-  run:
-    shell: bash
-    working-directory: template-workflow
-env:
-  TEMPLATE_CAPTURE_WORKFLOW: template-workflow-capture.yml
-  TEMPLATE_CI_WORKFLOW: template-workflow-ci.yml
+  workflow_call:
 permissions:
   contents: write
 concurrency:
-  group: template-workflow-release
+  group: template-workflow-production
   cancel-in-progress: false
 jobs:
-  release:
+  produce-and-release:
+    if: github.repository == 'models-one/dario'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: template-workflow
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ANTHROPIC_API_KEY: sk-dario-fingerprint-capture
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: template-workflow/package-lock.json
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run build
       - run: npm run verify:upstream
       - run: npm test
-      - run: npm run export
-      - name: Publish immutable versioned files
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json")).version')
-          tag="template-workflow-v$version"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists; leaving its immutable artifact unchanged."
-            exit 0
-          fi
-          gh release create "$tag" artifacts/official/cc-template-data.json artifacts/official/metadata.json artifacts/official/SHA256SUMS --target "$GITHUB_SHA" --title "Template workflow $version" --notes-file CHANGELOG.md
+      - name: Restore our last produced baseline
+        run: node scripts/production-release.mjs restore
+      - name: Capture latest Claude Code, bake and verify our output
+        env:
+          TEMPLATE_CC_CACHE_DIR: ${{ runner.temp }}/template-claude
+          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/template-claude-config
+        run: npm run produce
+      - name: Publish our verified template
+        run: node scripts/production-release.mjs publish
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: produced-template-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            template-workflow/artifacts/latest/
+            template-workflow/artifacts/production-result.json
+            template-workflow/artifacts/production-summary.md
+            template-workflow/drift-summary.md
+            template-workflow/rebake-summary.md
+            template-workflow/label-target.txt
+          if-no-files-found: ignore

@@ -39,10 +39,12 @@ export function makeBundle(raw, source) {
   return Buffer.from(JSON.stringify({ format: 'cc-template-bundle/v1', template_base64: Buffer.from(raw).toString('base64'), template_bytes: Buffer.byteLength(raw), template_sha256: sha256(raw), source }, null, 2) + '\n');
 }
 
-export function exportTemplate({ templatePath, out, source, origin = { type: 'observation' } }) {
+export function exportTemplate({ templatePath, out, source, provenance, origin = { type: 'local-export' } }) {
   const raw = readFileSync(templatePath);
   const t = validateTemplate(raw);
-  if (origin.type === 'dario-official' && (sha256(raw) !== origin.reference_sha256 || !origin.byte_identical)) throw new Error('Official export does not match its reference digest');
+  if (origin.type === 'dario-official') throw new Error('Official snapshot delivery is not supported');
+  if (provenance && (provenance.producer !== 'template-workflow' || provenance.template?.sha256 !== sha256(raw) || provenance.template?.cc_version !== t._version)) throw new Error('Template does not match its capture provenance');
+  if (provenance) origin = { type: 'template-workflow', operation: provenance.operation, upstream_commit: provenance.implementation.upstream_commit, run_url: provenance.run.url };
   // Validate every input before writing any deliverable.
   const bundle = source ? makeBundle(raw, source) : null;
   const target = resolve(out);
@@ -51,6 +53,12 @@ export function exportTemplate({ templatePath, out, source, origin = { type: 'ob
   const metadata = { format: 'template-workflow-artifact/v1', schema_version: 3, cc_version: t._version, captured_at: t._captured, bytes: raw.length, sha256: sha256(raw), tools: t.tools.length, variants: Object.keys(promptVariantsOf(t)), origin };
   writeFileSync(join(target, 'metadata.json'), JSON.stringify(metadata, null, 2) + '\n');
   let sums = `${metadata.sha256}  cc-template-data.json\n`;
+  if (provenance) {
+    const bytes = Buffer.from(JSON.stringify(provenance, null, 2) + '\n');
+    writeFileSync(join(target, 'provenance.json'), bytes);
+    sums += `${sha256(bytes)}  provenance.json\n`;
+  } else if (existsSync(join(target, 'provenance.json'))) rmSync(join(target, 'provenance.json'));
+  sums += `${sha256(readFileSync(join(target, 'metadata.json')))}  metadata.json\n`;
   if (bundle) {
     writeFileSync(join(target, 'cc-template-bundle.json'), bundle);
     sums += `${sha256(bundle)}  cc-template-bundle.json\n`;
