@@ -50,7 +50,7 @@ Active workflows live in the parent repository's `.github/workflows/`:
 - `template-workflow-liveness.yml`: every two hours, checks production watcher health.
 - `template-workflow-upstream-sync.yml`: checks Dario implementation updates; updates code and development fixtures only, preserving our production data.
 
-Capture/release uses a GitHub-hosted Ubuntu runner. Requests used for capture go to the loopback collector, with a placeholder API key; a personal Claude login or paid model request is not required. `GITHUB_TOKEN` with Contents write permission can publish the artifact; production does not depend on creating or merging a PR.
+Capture/release uses a fresh GitHub-hosted Ubuntu runner with Claude's default `~/.claude` configuration path so Dario's project-path scrubbing rules apply. Requests used for capture go to the loopback collector, with a placeholder API key; a personal Claude login or paid model request is not required. `GITHUB_TOKEN` with Contents write permission can publish the artifact; production does not depend on creating or merging a PR.
 
 Releases use `template-cc-<CC version>-<template digest>` tags. An unchanged template reuses its immutable release after checking its files. A rebake or label update produces a new tag. Baseline restoration only accepts this namespace, matching provenance and checksums; legacy official-snapshot releases are never restored.
 

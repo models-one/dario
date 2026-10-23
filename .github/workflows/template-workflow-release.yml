@@ -41,7 +41,6 @@ jobs:
       - name: Capture latest Claude Code, bake and verify our output
         env:
           TEMPLATE_CC_CACHE_DIR: ${{ runner.temp }}/template-claude
-          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/template-claude-config
         run: npm run produce
       - name: Publish our verified template
         run: node scripts/production-release.mjs publish
