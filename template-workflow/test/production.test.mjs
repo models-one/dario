@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { productionRecord, verifyProduction } from '../lib/production.mjs';
+import { productionRecord, verifyProduction, prepareCaptureBaseline } from '../lib/production.mjs';
 import { exportTemplate } from '../lib/template.mjs';
 import { verifyRelease, releaseTag, latestProductionRelease } from '../lib/release.mjs';
 const raw = readFileSync(new URL('./fixtures/seed-template.json', import.meta.url));
@@ -36,4 +36,26 @@ test('baseline selection ignores legacy official releases and incomplete release
   const candidates = [good, { tag_name: 'template-workflow-v0.2.1', published_at: '2026-12-01T00:00:00Z' }, { ...good, draft: true, published_at: '2026-12-02T00:00:00Z' }, { ...good, prerelease: true, published_at: '2026-12-03T00:00:00Z' }];
   assert.equal(latestProductionRelease(candidates), good);
   assert.equal(latestProductionRelease(candidates.slice(1)), undefined);
+});
+
+test('legacy hosted-config paths force fresh variant capture instead of sticking in A/B memory', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'repair-capture-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'src'));
+  const legacy = structuredClone(template);
+  legacy.system_prompt_variants.fable += '\nMemory at /home/user/work/_temp/template-claude-config/projects/old/memory/';
+  legacy._variantShapeHashes = { fable: ['old-shape'], 'opus-5': ['keep-this-shape'] };
+  const bytes = Buffer.from(JSON.stringify(legacy));
+  const proof = productionRecord({ raw: bytes, baseline: raw, client: { version: template._version, sha256: 'a'.repeat(64) }, operation: 'capture', upstreamCommit: 'b'.repeat(40), env: {} });
+  writeFileSync(join(root, 'src/cc-template-data.json'), bytes);
+  writeFileSync(join(root, 'src/cc-template-provenance.json'), JSON.stringify(proof));
+  assert.throws(() => verifyProduction(bytes, proof), /recapture/);
+  const repair = prepareCaptureBaseline(root);
+  assert.deepEqual(repair.recaptured_variants, ['fable']);
+  const prepared = JSON.parse(readFileSync(join(root, 'src/cc-template-data.json')));
+  assert.deepEqual(prepared.tools, template.tools);
+  assert.equal(prepared.system_prompt_variants.fable, undefined);
+  assert.equal(prepared._variantShapeHashes.fable, undefined);
+  assert.deepEqual(prepared._variantShapeHashes['opus-5'], ['keep-this-shape']);
+  assert.equal(existsSync(join(root, 'src/cc-template-provenance.json')), false);
+  assert.equal(prepareCaptureBaseline(root), null);
 });

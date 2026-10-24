@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } fr
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prepareClaude } from '../lib/claude-runtime.mjs';
-import { readProduction, PROVENANCE_FILE } from '../lib/production.mjs';
+import { readProduction, PROVENANCE_FILE, prepareCaptureBaseline } from '../lib/production.mjs';
 import { sha256 } from '../lib/template.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 function cli(...args) {
@@ -20,6 +20,8 @@ try {
   if (!client.package || !client.package_integrity) throw new Error('Production requires a verified npm native client, not an explicit binary');
   process.env.TEMPLATE_PREPARED_CC = JSON.stringify(client);
   const before = readFileSync(join(root, 'src/cc-template-data.json'));
+  const repair = prepareCaptureBaseline(root);
+  if (repair) { process.env.TEMPLATE_BASELINE_REPAIR = JSON.stringify(repair); console.log(`Recapturing legacy config-path variants: ${repair.recaptured_variants.join(', ')}`); }
   const hasProvenance = existsSync(join(root, PROVENANCE_FILE));
   if (hasProvenance) readProduction(root); // Corrupt evidence never silently falls back to a bootstrap.
   const code = cli('check');

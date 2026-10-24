@@ -30,7 +30,7 @@ try {
     } else {
       scratch = mkdtempSync(join(tmpdir(), 'producer-baseline-'));
       download(previous.tag_name, scratch);
-      const verified = verifyRelease(scratch, { repository: repo, tag: previous.tag_name });
+      const verified = verifyRelease(scratch, { repository: repo, tag: previous.tag_name, allowRepairableBaseline: true });
       copyFileSync(join(scratch, 'cc-template-data.json'), join(root, 'src/cc-template-data.json'));
       copyFileSync(join(scratch, 'provenance.json'), join(root, 'src/cc-template-provenance.json'));
       console.log(`Restored our produced baseline: ${verified.tag}`);
