@@ -1,43 +1,52 @@
 {
   "format": "template-workflow-production/v1",
   "producer": "template-workflow",
+  "target_platform": "darwin",
   "operation": "capture",
-  "produced_at": "2026-10-24T01:35:45.822Z",
+  "produced_at": "2026-10-24T06:11:09.478Z",
   "template": {
     "cc_version": "2.1.310",
-    "captured_at": "2026-10-24T01:35:23.941Z",
-    "bytes": 164480,
-    "sha256": "ad8634ad8fa9fa4fa122b3335f0ab67b793818135e8aaae07edd5171d25ffbe4"
+    "captured_at": "2026-10-24T06:10:47.753Z",
+    "bytes": 149184,
+    "sha256": "ac201478aa01163620ed67a1d3daf4eb8376686dbe1187ad6d65065676cbe64e"
   },
   "client": {
     "version": "2.1.310",
-    "platform": "linux-x64",
-    "sha256": "b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56",
-    "package": "@anthropic-ai/claude-code-linux-x64",
-    "package_integrity": "sha512-CuzpJrMBbqaR3+1SiLrBtPV3w/cFvcqBfhe9kNskzZ2Fm6KXa7v0l7tM+Ln6l5QLb79WoU0CcacXnYtsygbe6A==",
+    "platform": "darwin-arm64",
+    "sha256": "ffb64331bc0ee1b69efb7c2c428bd3ab516bc31b75bf60886b356c97c1c25ffd",
+    "package": "@anthropic-ai/claude-code-darwin-arm64",
+    "package_integrity": "sha512-1HkmRv3tvMTjTrsW5J17S3NtjFjEDC8nnhduNT0klPStHes8/FRX1YFv7UwnfC6fuwd31kFuzWLyNn2IN07JtQ==",
     "requested": "latest",
-    "resolved_at": "2026-10-24T01:35:18.212Z"
+    "resolved_at": "2026-10-24T06:10:42.203Z"
   },
   "baseline": {
     "cc_version": "2.1.310",
-    "sha256": "c2e7653dbd926b1e103e8e35fb90a97ba011f9ef59a315fb59ac19ec62665ac0",
+    "sha256": "44b17656a4a6b64bc3c7fd5396593eaeab93945813db2bf4051c5e67a5d41eb1",
     "repair": {
-      "reason": "legacy-temporary-config-path",
-      "previous_sha256": "6c51f3d76162b899645dea5c9f440b70d2fd055048192250cf3ecca70f038f5a",
+      "reason": "macos-platform-migration",
+      "previous_sha256": "ad8634ad8fa9fa4fa122b3335f0ab67b793818135e8aaae07edd5171d25ffbe4",
+      "previous_capture_platform": "linux-x64",
+      "target_platform": "darwin",
+      "removed_tools": [
+        "Glob",
+        "Grep",
+        "PowerShell"
+      ],
       "recaptured_variants": [
         "fable",
-        "opus-5"
+        "opus-5",
+        "sonnet-5"
       ]
     }
   },
   "implementation": {
     "upstream_commit": "0a4a7bc6cda6e0ab9fbba250d3d50fa273c6a4cc",
     "repository": "models-one/dario",
-    "commit": "0f8c924543f86e1c7182b8508454506d1b8b1dd0"
+    "commit": "04db05e3e0795e324733bfc84de3233ae5ca8066"
   },
   "run": {
-    "id": "40050409013",
+    "id": "40069098462",
     "attempt": "1",
-    "url": "https://github.com/models-one/dario/actions/runs/40050409013"
+    "url": "https://github.com/models-one/dario/actions/runs/40069098462"
   }
 }

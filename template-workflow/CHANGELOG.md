@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Seed the macOS baseline from the verified darwin-arm64 capture of CC 2.1.310 (34 tools, three model variants).
+
 - Target macOS exclusively: verify native darwin client provenance, isolate macOS releases, remove other-platform tools, and recapture all variants when migrating from Linux.
 - Run hosted capture and CI on macOS; support capture previews before publishing.
 
