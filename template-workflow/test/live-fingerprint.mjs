@@ -371,8 +371,10 @@ header('loadTemplate - restores preserved tools a headless live capture omitted'
   for (const t of ['WebFetch', 'WebSearch', 'Monitor', 'NotebookEdit']) {
     check(`deferred tool restored: ${t}`, names.includes(t));
   }
-  if (process.platform !== 'win32') {
-    check('other-platform tool restored: PowerShell', names.includes('PowerShell'));
+  // The producer baseline is macOS-only; merging its live cache must not
+  // inject platform tools removed during the macOS baseline migration.
+  for (const tool of ['PowerShell', 'Glob', 'Grep']) {
+    check(`macOS baseline does not inject ${tool}`, !names.includes(tool));
   }
 
   // tool_names === tools.map(name) is the contract everywhere; the bake shipped

@@ -90,7 +90,8 @@
     "test/live-fingerprint.mjs": {
       "source_path": "test/live-fingerprint.mjs",
       "source_sha256": "853f48b7aff26a33ceedab26a0460d6e516dd056f14903f71721104f7c3b5752",
-      "local_sha256": "853f48b7aff26a33ceedab26a0460d6e516dd056f14903f71721104f7c3b5752"
+      "local_sha256": "16d841cea7613898bd0bba1f618661d6c7fd79718d4d9780eb7592d551920398",
+      "change": "Assert macOS baseline exclusion of Windows tools; original cross-platform preservation remains covered by replay tests."
     },
     "test/scrub-template.mjs": {
       "source_path": "test/scrub-template.mjs",

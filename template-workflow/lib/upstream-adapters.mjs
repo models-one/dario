@@ -16,6 +16,14 @@ export function adaptUpstreamSource(target, raw) {
     changes.push('Require macOS for template baking; keep the original multi-model capture, scrub, preservation and drift algorithms.');
 
   }
+  if (target === 'test/live-fingerprint.mjs') {
+    const before = text;
+    const old = "  if (process.platform !== 'win32') {\n    check('other-platform tool restored: PowerShell', names.includes('PowerShell'));\n  }";
+    const scoped = "  // The producer baseline is macOS-only; merging its live cache must not\n  // inject platform tools removed during the macOS baseline migration.\n  for (const tool of ['PowerShell', 'Glob', 'Grep']) {\n    check(`macOS baseline does not inject ${tool}`, !names.includes(tool));\n  }";
+    if (!text.includes(old) && !text.includes('macOS baseline does not inject')) throw new Error('Live cache platform assertion changed; review before importing');
+    text = text.replace(old, scoped);
+    if (text !== before) changes.push('Assert macOS baseline exclusion of Windows tools; original cross-platform preservation remains covered by replay tests.');
+  }
   if (target === 'scripts/rebake-release-prep.mjs' || target === 'scripts/check-rebake-content.mjs') {
     const before = text;
     text = text.replaceAll('HEAD:${BUNDLE}', 'HEAD:./${BUNDLE}').replaceAll('HEAD:${REL}', 'HEAD:./${REL}');
