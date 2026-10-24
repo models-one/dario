@@ -45,5 +45,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: npm-drift-${{ github.run_id }}
-          path: template-workflow/drift-report.json
+          path: |
+            template-workflow/drift-report.json
+            template-workflow/automation-summary.md
           if-no-files-found: ignore

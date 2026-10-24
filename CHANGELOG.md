@@ -13,6 +13,8 @@ and CI fails a bump that strands one.
 
 ## [Unreleased]
 
+- Fix template npm drift automation failing before capture dispatch when repository Issues are disabled.
+
 - Publish native macOS, Windows and Linux template products and a verified total package from one workflow run.
 
 - Add the standalone template producer under `template-workflow/`, with capture regression tests and dedicated Actions workflows.

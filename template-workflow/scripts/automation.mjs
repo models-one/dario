@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdtempSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, appendFileSync, rmSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -39,7 +39,27 @@ function captureCheck() {
 }
 function ensureLabel(label) { gh('label', 'create', label, '--color', 'D4C5F9', '--force'); }
 function issues(label) { return ghJSON('issue', 'list', '--state', 'open', '--label', label, '--json', 'number'); }
+function recordAutomationSummary(title, body) {
+  const text = `## ${title}\n\n${body}\n\n`;
+  appendFileSync(join(root, 'automation-summary.md'), text);
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, text);
+}
+let repositoryHasIssues;
 function issue(label, title, body, close = false) {
+  // Reporting must remain available when a fork intentionally disables Issues.
+  // Only an explicit false selects this path; auth/network/API failures still fail.
+  recordAutomationSummary(close ? `${title} — resolved` : title, body);
+  if (repositoryHasIssues === undefined) {
+    const metadata = ghJSON('api', `repos/${repo}`);
+    if (typeof metadata.has_issues !== 'boolean') throw new Error('GitHub repository metadata did not include has_issues');
+    repositoryHasIssues = metadata.has_issues;
+  }
+  if (!repositoryHasIssues) {
+    const note = 'GitHub Issues are disabled for this repository; notification saved in the workflow summary and automation-summary.md.';
+    console.log(note);
+    recordAutomationSummary('Notification destination', note);
+    return;
+  }
   ensureLabel(label);
   const open = issues(label);
   if (close) { for (const i of open) gh('issue', 'close', String(i.number), '--comment', body); return; }
@@ -137,6 +157,7 @@ export function npmWatch() {
   if (!report.ccVersion || !Array.isArray(report.items)) throw new Error('npm scanner failed before obtaining a valid comparison');
   issue('cc-drift', `Claude Code npm drift: ${report.ccVersion}`, `${report.items.map((i) => `- ${i.category}: ${i.message}`).join('\n')}\n\n${runURL}`);
   gh('workflow', 'run', captureWorkflow, '--ref', base);
+  recordAutomationSummary('Capture workflow dispatched', `Workflow: ${captureWorkflow}. Branch: ${base}. Detected Claude Code: ${report.ccVersion}.`);
   if (process.env.TEMPLATE_PR_UPDATES_ENABLED !== 'true') { console.log('Capture dispatched. Compatibility PR updates require an approved bot token.'); return; }
   const branch = `bot/cc-drift-v${report.ccVersion}`;
   if (prs(branch).some((p) => p.headRefName === branch)) return;

@@ -63,3 +63,5 @@ npm run export
 - `template-workflow-upstream-sync.yml`: optional manual source import; no schedule.
 
 Manual release dispatch accepts `publish=false` to exercise all native captures and aggregation, upload Actions artifacts, and skip release publication. Windows is validated by its real native capture job; POSIX mock-client tests run on macOS/Linux. `verify:source` checks local files only. Maintenance PRs require an organization-approved bot token; normal four-product publication uses `GITHUB_TOKEN` and does not depend on PR creation.
+
+GitHub Issues are optional for drift/liveness notifications. When the repository disables Issues, the automation writes its notification to the Actions step summary and `automation-summary.md`; npm drift still dispatches capture. The npm-drift artifact includes both the scan report and notification summary. Authentication, network, API and workflow-dispatch errors remain job failures.

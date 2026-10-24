@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Keep npm drift and liveness reporting operational when GitHub Issues are disabled: preserve workflow summaries and scan artifacts while allowing capture dispatch.
+
 - Produce macOS, Windows, Linux and total template releases from a single resolved npm version and verified workflow batch.
 - Preserve exact platform files, record observed-versus-historical tool selection, and reject incomplete aggregation inputs.
 

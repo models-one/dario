@@ -14,3 +14,4 @@ drift-report.json
 *.credentials.json
 
 capture-observation.json
+automation-summary.md
