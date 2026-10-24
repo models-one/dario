@@ -76,7 +76,7 @@ test('real CLI capture/check/label/export chain with a controlled Claude process
   r = cli(['export', '--out', join(work, 'default-output')]); assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(readFileSync(join(work, 'default-output/cc-template-data.json')), readFileSync(join(work, 'src/cc-template-data.json')));
   assert.equal(JSON.parse(readFileSync(join(work, 'default-output/metadata.json'))).origin.type, 'template-workflow');
-  assert.equal(JSON.parse(readFileSync(join(work, 'default-output/metadata.json'))).target_platform, 'darwin');
+  assert.equal(JSON.parse(readFileSync(join(work, 'default-output/metadata.json'))).target_platform, process.platform);
   assert.equal(JSON.parse(readFileSync(join(work, 'default-output/provenance.json'))).operation, 'label-sync');
   r = cli(['export', '--template', join(work, 'src/cc-template-data.json')]); assert.equal(r.status, 1);
   mkdirSync(join(work, 'reference'), { recursive: true });

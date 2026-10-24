@@ -164,10 +164,10 @@ if (isOlderCCVersion(captured._version, prev._version)) {
 }
 
 
-// This producer publishes macOS templates. Checks may run elsewhere, but
-// a production bake must come from the native macOS client on a macOS host.
-if (!CHECK_MODE && process.platform !== 'darwin') {
-  log(`error: refusing to bake a macOS template from ${process.platform}. Run the macOS capture workflow.`);
+// A native template must be baked on its declared platform.
+const capturePlatform = process.env.TEMPLATE_TARGET_PLATFORM || process.platform;
+if (!CHECK_MODE && (!['linux', 'darwin', 'win32'].includes(capturePlatform) || process.platform !== capturePlatform)) {
+  log(`error: refusing to bake ${capturePlatform} from ${process.platform}.`);
   process.exit(1);
 }
 
@@ -423,6 +423,12 @@ if (Object.keys(variants).length > 0) scrubbed.system_prompt_variants = variants
 }
 
 // ── --check mode: diff and exit; do not write ────────────────────────
+writeFileSync(join(repoRoot, 'capture-observation.json'), JSON.stringify({
+  format: 'template-workflow-observation/v1', platform: process.platform, cc_version: captured._version, captured_at: captured._captured,
+  observed_tools: captured.tools.filter((t) => !t.name.startsWith('mcp__')).map((t) => t.name),
+  variant_outcomes: variantOutcomes, variant_hashes: capturedArmHashes, run_id: process.env.GITHUB_RUN_ID || null,
+}, null, 2) + '\n');
+
 if (CHECK_MODE) {
   // Remove any leftover drift-summary.md BEFORE diffing. The watch workflow
   // embeds the file into issue/PR bodies whenever it exists, but this run

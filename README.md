@@ -247,4 +247,4 @@ Built in the open, scars included. Follow the build: **[@ask_alf](https://x.com/
 
 [^plans]: Pro at $20 a month, Max 5x at $100, Max 20x at $200, as listed on [claude.com/pricing](https://claude.com/pricing) on 2026-09-06. Annual billing is cheaper; check the page for what's current.
 
-Standalone template capture and drift automation lives in [template-workflow/](template-workflow/README.md). Dedicated Actions capture the latest native Claude Code on hosted macOS, validate the produced templates and publish them with capture provenance. See [repository setup](docs/template-workflow.md).
+Standalone template capture and drift automation lives in [template-workflow/](template-workflow/README.md). Dedicated Actions capture the latest native Claude Code on macOS, Windows and Linux, validate each platform, and publish three native templates plus a total package with capture provenance. See [repository setup](docs/template-workflow.md).

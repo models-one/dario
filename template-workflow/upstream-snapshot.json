@@ -37,8 +37,8 @@
     "scripts/capture-and-bake.mjs": {
       "source_path": "scripts/capture-and-bake.mjs",
       "source_sha256": "ee0333c98b4967459a6a8d334b81460526a0323f3a59c679f5966e95f2761f3c",
-      "local_sha256": "bc1b0036436cc9f53688ecfd8e2686f10e9fb1a68483672321ab85e02cf796ad",
-      "change": "Import preservation constants from their defining module; verified against the original bake by replay. Require macOS for template baking; keep the original multi-model capture, scrub, preservation and drift algorithms."
+      "local_sha256": "e13d57f533292041199997ff363cb55b23db01e9949049804c8f00d90720d44e",
+      "change": "Import preservation constants from their defining module; verified against the original bake by replay. Require the configured native host and record observed tools/model outcomes; retain capture, scrub, preservation and drift algorithms."
     },
     "scripts/drift-report.mjs": {
       "source_path": "scripts/drift-report.mjs",

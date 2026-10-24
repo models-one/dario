@@ -13,6 +13,8 @@ and CI fails a bump that strands one.
 
 ## [Unreleased]
 
+- Publish native macOS, Windows and Linux template products and a verified total package from one workflow run.
+
 - Add the standalone template producer under `template-workflow/`, with capture regression tests and dedicated Actions workflows.
 - Publish independently captured latest-Claude-Code templates with provenance on hosted Linux.
 

@@ -25,7 +25,7 @@ test('published and restored artifacts require our provenance, metadata and comp
   const input = join(dir, 'input.json'); writeFileSync(input, raw);
   const out = join(dir, 'out');
   exportTemplate({ templatePath: input, out, provenance: record() });
-  const result = verifyRelease(out, { repository: 'owner/producer', tag: releaseTag(raw) });
+  const result = verifyRelease(out, { repository: 'owner/producer', tag: releaseTag(raw, 'darwin') });
   assert.deepEqual(result.raw, raw); assert.equal(result.metadata.origin.type, 'template-workflow');
   assert.equal(result.provenance.run.url, 'https://github.com/owner/producer/actions/runs/123');
   assert.throws(() => verifyRelease(out, { tag: `template-macos-cc-${template._version}-${'0'.repeat(16)}` }), /tag/);
@@ -35,10 +35,10 @@ test('published and restored artifacts require our provenance, metadata and comp
   assert.throws(() => verifyRelease(out), /our produced/);
 });
 test('baseline selection ignores legacy official releases and incomplete releases', () => {
-  const good = { tag_name: releaseTag(raw), published_at: '2026-10-23T00:00:00Z' };
+  const good = { tag_name: releaseTag(raw, 'darwin'), published_at: '2026-10-23T00:00:00Z' };
   const candidates = [good, { tag_name: `template-cc-${template._version}-${'a'.repeat(16)}`, published_at: '2027-01-01T00:00:00Z' }, { tag_name: 'template-workflow-v0.2.1', published_at: '2026-12-01T00:00:00Z' }, { ...good, draft: true, published_at: '2026-12-02T00:00:00Z' }, { ...good, prerelease: true, published_at: '2026-12-03T00:00:00Z' }];
-  assert.equal(latestProductionRelease(candidates), good);
-  assert.equal(latestProductionRelease(candidates.slice(1)), undefined);
+  assert.equal(latestProductionRelease(candidates, 'darwin'), good);
+  assert.equal(latestProductionRelease(candidates.slice(1), 'darwin'), undefined);
 });
 
 test('legacy hosted-config paths force fresh variant capture instead of sticking in A/B memory', (t) => {
@@ -52,7 +52,7 @@ test('legacy hosted-config paths force fresh variant capture instead of sticking
   writeFileSync(join(root, 'src/cc-template-data.json'), bytes);
   writeFileSync(join(root, 'src/cc-template-provenance.json'), JSON.stringify(proof));
   assert.throws(() => verifyProduction(bytes, proof), /recapture/);
-  const repair = prepareCaptureBaseline(root);
+  const repair = prepareCaptureBaseline(root, { targetPlatform: 'darwin' });
   assert.deepEqual(repair.recaptured_variants, ['fable']);
   const prepared = JSON.parse(readFileSync(join(root, 'src/cc-template-data.json')));
   assert.deepEqual(prepared.tools, template.tools);
@@ -68,7 +68,7 @@ test('macOS export rejects Linux provenance and Windows tool definitions', (t) =
   const linux = record(); linux.client.platform = 'linux-x64';
   assert.throws(() => verifyProduction(raw, linux), /macOS/);
   const missing = record(); delete missing.target_platform;
-  assert.throws(() => verifyProduction(raw, missing), /macOS/);
+  assert.throws(() => verifyProduction(raw, missing, { targetPlatform: 'darwin' }), /macOS/);
   const contaminated = structuredClone(template);
   contaminated.tools.push({ name: 'PowerShell', description: 'Windows-only', input_schema: { type: 'object' } });
   contaminated.tool_names.push('PowerShell');
@@ -91,8 +91,8 @@ test('Linux baseline migration drops foreign tools and all prompt history before
   const proof = productionRecord({ raw: bytes, baseline: raw, client: { version: template._version, sha256: 'a'.repeat(64), platform: 'linux-x64' }, operation: 'capture', upstreamCommit: 'b'.repeat(40), env: {} });
   delete proof.target_platform;
   writeFileSync(join(dir, 'src/cc-template-data.json'), bytes); writeFileSync(join(dir, 'src/cc-template-provenance.json'), JSON.stringify(proof));
-  const migration = prepareCaptureBaseline(dir);
-  assert.equal(migration.reason, 'macos-platform-migration'); assert.equal(migration.previous_capture_platform, 'linux-x64');
+  const migration = prepareCaptureBaseline(dir, { targetPlatform: 'darwin' });
+  assert.equal(migration.reason, 'platform-migration'); assert.equal(migration.previous_capture_platform, 'linux-x64');
   assert.deepEqual(migration.removed_tools, ['PowerShell']);
   const migrated = JSON.parse(readFileSync(join(dir, 'src/cc-template-data.json')));
   assert.equal(migrated.tools.some((tool) => tool.name === 'PowerShell'), false);

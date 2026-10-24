@@ -1,4 +1,4 @@
-// Declared source adaptations include module paths and the macOS bake host. HEAD:./ is relative to the producer, even in a larger Git repo.
+// Declared source adaptations include module paths, native host guards and observation evidence. HEAD:./ is relative to the producer, even in a larger Git repo.
 export function adaptUpstreamSource(target, raw) {
   let text = raw.toString();
   const changes = [];
@@ -12,8 +12,11 @@ export function adaptUpstreamSource(target, raw) {
     text = text.replace("const ALLOW_NON_LINUX = process.argv.includes('--allow-non-linux-bake');\n", '');
     const start = text.indexOf('// Bake host must be Linux,');
     const end = text.indexOf('// Preserve other-platform tools from the previous bundle', start);
-    text = text.slice(0, start) + "// This producer publishes macOS templates. Checks may run elsewhere, but\n// a production bake must come from the native macOS client on a macOS host.\nif (!CHECK_MODE && process.platform !== 'darwin') {\n  log(`error: refusing to bake a macOS template from ${process.platform}. Run the macOS capture workflow.`);\n  process.exit(1);\n}\n\n" + text.slice(end);
-    changes.push('Require macOS for template baking; keep the original multi-model capture, scrub, preservation and drift algorithms.');
+    text = text.slice(0, start) + "// A native template must be baked on its declared platform.\nconst capturePlatform = process.env.TEMPLATE_TARGET_PLATFORM || process.platform;\nif (!CHECK_MODE && (!['linux', 'darwin', 'win32'].includes(capturePlatform) || process.platform !== capturePlatform)) {\n  log(`error: refusing to bake ${capturePlatform} from ${process.platform}.`);\n  process.exit(1);\n}\n\n" + text.slice(end);
+    const evidenceAt = text.indexOf('\nif (CHECK_MODE) {', text.indexOf('scrubbed._variantShapeHashes'));
+    if (evidenceAt < 0) throw new Error('Capture evidence insertion point changed');
+    text = text.slice(0, evidenceAt) + "\nwriteFileSync(join(repoRoot, 'capture-observation.json'), JSON.stringify({\n  format: 'template-workflow-observation/v1', platform: process.platform, cc_version: captured._version, captured_at: captured._captured,\n  observed_tools: captured.tools.filter((t) => !t.name.startsWith('mcp__')).map((t) => t.name),\n  variant_outcomes: variantOutcomes, variant_hashes: capturedArmHashes, run_id: process.env.GITHUB_RUN_ID || null,\n}, null, 2) + '\\n');\n" + text.slice(evidenceAt);
+    changes.push('Require the configured native host and record observed tools/model outcomes; retain capture, scrub, preservation and drift algorithms.');
 
   }
   if (target === 'test/live-fingerprint.mjs') {

@@ -4,8 +4,9 @@ import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsS
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { TARGET_PLATFORM, profile } from '../lib/platform.mjs';
 import { readProduction, PROVENANCE_FILE } from '../lib/production.mjs';
-import { RELEASE_FILES, latestProductionRelease, latestLegacyProductionRelease, verifyRelease } from '../lib/release.mjs';
+import { RELEASE_FILES, releaseFiles, latestProductionRelease, latestLegacyProductionRelease, verifyRelease } from '../lib/release.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repo = process.env.GITHUB_REPOSITORY || process.env.GH_REPO;
 function gh(...args) {
@@ -19,45 +20,46 @@ function releases() {
   if (result.error || result.status !== 0) throw new Error(`Could not list producer releases: ${result.stderr || result.error?.message}`);
   return JSON.parse(result.stdout).flat();
 }
-function download(tag, dir) { gh('release', 'download', tag, '--dir', dir, ...RELEASE_FILES.flatMap((name) => ['--pattern', name])); }
+function download(tag, dir, platform = TARGET_PLATFORM) { gh('release', 'download', tag, '--dir', dir, ...releaseFiles(platform).flatMap((name) => ['--pattern', name])); }
 let scratch;
 try {
   if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error('Set GITHUB_REPOSITORY or GH_REPO');
   const mode = process.argv[2];
   if (mode === 'restore') {
     const available = releases();
-    let previous = latestProductionRelease(available);
-    const proofFile = join(root, PROVENANCE_FILE);
-    const checkedIn = existsSync(proofFile) ? JSON.parse(readFileSync(proofFile)) : null;
-    const hasMacOSBaseline = checkedIn?.target_platform === 'darwin';
-    if (!previous && hasMacOSBaseline) readProduction(root, { repository: repo });
-    if (!previous && !hasMacOSBaseline) previous = latestLegacyProductionRelease(available);
+    const previous = latestProductionRelease(available, TARGET_PLATFORM);
     if (!previous) {
-      console.log(hasMacOSBaseline ? 'Using the verified checked-in macOS baseline; no legacy release will replace it.' : 'No macOS release exists yet. A fresh macOS capture is required before publication.');
+      const proofFile = join(root, PROVENANCE_FILE);
+      const baseline = existsSync(proofFile) ? JSON.parse(readFileSync(proofFile)) : null;
+      if (baseline) readProduction(root, { repository: repo, targetPlatform: baseline.target_platform, allowLegacyPlatform: !baseline.target_platform });
+      console.log(`No ${profile(TARGET_PLATFORM).label} release yet. The checked-in baseline will be migrated before native capture if needed.`);
     } else {
       scratch = mkdtempSync(join(tmpdir(), 'producer-baseline-'));
-      download(previous.tag_name, scratch);
-      const verified = verifyRelease(scratch, { repository: repo, tag: previous.tag_name, allowRepairableBaseline: true, allowLegacyPlatform: !previous.tag_name.startsWith('template-macos-cc-') });
+      download(previous.tag_name, scratch, TARGET_PLATFORM);
+      verifyRelease(scratch, { repository: repo, tag: previous.tag_name, targetPlatform: TARGET_PLATFORM, allowRepairableBaseline: true });
       copyFileSync(join(scratch, 'cc-template-data.json'), join(root, 'src/cc-template-data.json'));
       copyFileSync(join(scratch, 'provenance.json'), join(root, 'src/cc-template-provenance.json'));
-      console.log(`Restored ${previous.tag_name.startsWith('template-macos-cc-') ? 'macOS' : 'legacy migration'} baseline: ${previous.tag_name}`);
+      console.log(`Restored ${profile(TARGET_PLATFORM).label} baseline: ${previous.tag_name}`);
     }
   } else if (mode === 'publish') {
-    const dir = join(root, 'artifacts/latest');
-    const artifact = verifyRelease(dir, { repository: repo });
+    const dir = process.argv[3] ? resolve(process.argv[3]) : join(root, 'artifacts/latest');
+    const artifact = verifyRelease(dir, { repository: repo, targetPlatform: TARGET_PLATFORM });
     const existing = releases().find((release) => release.tag_name === artifact.tag);
     if (existing) {
       if (existing.draft || existing.prerelease) throw new Error('The production release tag is already used by an incomplete release');
       scratch = mkdtempSync(join(tmpdir(), 'producer-existing-'));
       download(artifact.tag, scratch);
-      const published = verifyRelease(scratch, { repository: repo, tag: artifact.tag });
+      const published = verifyRelease(scratch, { repository: repo, tag: artifact.tag, targetPlatform: TARGET_PLATFORM });
       if (!published.raw.equals(artifact.raw)) throw new Error('Existing immutable release has different bytes');
       console.log(`Verified existing produced release: ${artifact.tag}`);
     } else {
       scratch = mkdtempSync(join(tmpdir(), 'producer-notes-'));
       const notes = join(scratch, 'notes.md');
-      writeFileSync(notes, `Generated by Template Workflow on macOS using the verified native Claude Code ${artifact.metadata.cc_version} client from npm.\n\nThis release combines captured request data with retained tool definitions from this project's previous template baseline. Not every tool definition is freshly captured in each run. Production uses the implementation and baseline maintained in this repository; it does not download another project's templates.\n\n${readFileSync(join(root, 'artifacts/production-summary.md'), 'utf8')}\nThe provenance records the client digest, previous baseline digest and capture workflow run.\n`);
-      gh('release', 'create', artifact.tag, ...RELEASE_FILES.map((name) => join(dir, name)), '--target', process.env.GITHUB_SHA || 'master', '--title', `macOS Claude Code ${artifact.metadata.cc_version} template (${artifact.metadata.sha256.slice(0, 12)})`, '--notes-file', notes, '--latest');
+      const summary = TARGET_PLATFORM === 'all'
+        ? 'This aggregate includes the exact macOS, Windows and Linux templates plus platforms.json for selection. Its compatibility union uses the Linux prompt by default; use the platform files for native prompt/tool fidelity.'
+        : `Captured and checked on a native ${profile(TARGET_PLATFORM).label} runner using the verified npm Claude Code client.`;
+      writeFileSync(notes, `Generated by Template Workflow for ${profile(TARGET_PLATFORM).label}, Claude Code ${artifact.metadata.cc_version}.\n\n${summary}\n\nTemplates combine observed request data with eligible historical tool definitions. Not every tool definition is newly captured in each run. Production uses this repository's implementation and owned baseline.\n\nTools: ${artifact.metadata.tools}. Template SHA-256: ${artifact.metadata.sha256}.\nCapture/source: ${artifact.metadata.origin.run_url}\n\nChecksums and provenance are included.\n`);
+      gh('release', 'create', artifact.tag, ...releaseFiles(TARGET_PLATFORM).map((name) => join(dir, name)), '--target', process.env.GITHUB_SHA || 'master', '--title', `${profile(TARGET_PLATFORM).label} Claude Code ${artifact.metadata.cc_version} template (${(artifact.metadata.bundle_sha256 || artifact.metadata.sha256).slice(0, 12)})`, '--notes-file', notes, TARGET_PLATFORM === 'all' ? '--latest' : '--latest=false');
       console.log(`Published our produced template: ${artifact.tag}`);
     }
   } else throw new Error('Expected restore or publish');

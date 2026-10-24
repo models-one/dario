@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Produce macOS, Windows, Linux and total template releases from a single resolved npm version and verified workflow batch.
+- Preserve exact platform files, record observed-versus-historical tool selection, and reject incomplete aggregation inputs.
+
 - Seed the macOS baseline from the verified darwin-arm64 capture of CC 2.1.310 (34 tools, three model variants).
 
 - Target macOS exclusively: verify native darwin client provenance, isolate macOS releases, remove other-platform tools, and recapture all variants when migrating from Linux.

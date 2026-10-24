@@ -1,43 +1,17 @@
-# Template producer workflows
+# Four-platform template workflows
 
-The producer lives in `template-workflow/`. Its build, dependencies and source lock are separate from the parent Dario application.
+The producer is in `template-workflow/`. One scheduled or manual run publishes four products: total, macOS, Windows and Linux.
 
-## Production path
+The release workflow resolves the latest Claude Code version once, then uses macOS, Windows and Linux hosted runners to install verified native clients at that exact version. Each restores its own baseline, captures and cleans request templates, detects drift and rebakes or synchronizes labels. A job records current observation evidence even when no rebake is needed.
 
-The scheduled capture workflow calls the release workflow on a GitHub-hosted macOS runner. Every run resolves npm latest once, verifies the native Claude Code client, performs the producer's multi-model capture against a local collector, scrubs and merges tools, detects drift, then rebakes or synchronizes labels as needed. It validates and publishes our generated template.
+Aggregation requires all three native outputs from the same workflow run, version and commit. It verifies checksums, platform provenance and successful model captures. Missing inputs, wrong-platform artifacts, version mismatches, corrupt bytes or failed variants stop publication. The entire set is verified before the first release write.
 
-Production reads our last published macOS release as its baseline. It never exports an official Dario snapshot. All implementation code and regression fixtures are stored locally. Optional third-party source imports require an explicit manual dispatch and never touch the production baseline.
+Native release tags use `template-macos-cc-*`, `template-windows-cc-*` and `template-linux-cc-*`. The total uses `template-all-cc-*` and becomes Latest after the native releases succeed. Retrying publication verifies existing immutable assets and completes missing releases.
 
-Published files: `cc-template-data.json`, `metadata.json`, `provenance.json`, `SHA256SUMS`. Their release tag is `template-macos-cc-<version>-<digest>`. The provenance identifies the client binary, baseline digest and capture run. Failed capture, invalid provenance, unexpected tool loss or a version mismatch stops publication.
+Every release has the template, metadata, provenance and SHA256SUMS. The total also has exact platform-specific JSON files and platforms.json. Its schema 3 compatibility union uses Linux prompts and observed-first tool selection; metadata lists cross-platform definition conflicts. Consumers needing platform fidelity select the native file. No schema 3 contract extension is required.
 
-Only macOS captures (`target_platform=darwin`, native client `darwin-*`) qualify for publication. A migration from a Linux/generic baseline removes other-platform tools and discards all model variants and A/B history, forcing fresh macOS capture. Missing model-family capture blocks publication. The current Windows-only tools PowerShell/Glob/Grep cannot pass export validation. Historical platform-neutral definitions are still retained when not observed; this is a macOS template inventory, not a single raw request. Development fixtures are not publishable artifacts.
+The producer and its initial historical baseline originated in Dario. Code, tests and baselines are now locally maintained, and scheduled production does not fetch upstream source or templates. Some tools remain historically preserved rather than freshly observed. Original licensing and source attribution remain available.
 
-## Workflows
+Scheduled capture runs hourly at :41. Manual dispatch with `publish=false` runs the same full capture/aggregation without publishing. CI covers Node 22/24 on macOS and Linux; Windows is exercised by real native capture. No personal Claude login is required for the local collector. Optional source import is manual-only.
 
-- `ci`: Node 22/24 macOS build and regression checks.
-- `capture`: hourly at :41; calls production/release.
-- `release`: capture latest, validate and publish on changes or manual dispatch.
-- `npm-drift`: hourly at :00; checks npm and dispatches production on drift.
-- `liveness`: every two hours; checks the capture workflow.
-- `upstream-sync`: manual-only source maintenance; never scheduled or called by production.
-
-Only this repository (`models-one/dario`) enables the operational schedules. Hosted capture uses a placeholder API key and the local loopback collector; it needs no self-hosted runner or Claude account credentials. The production workflow declares Contents write permission for `GITHUB_TOKEN`.
-
-Maintenance PRs require an organization-approved `CC_DRIFT_BOT_PAT`; without it, source updates are reported as issues and normal template production continues independently. Optional auto-merge uses `TEMPLATE_AUTO_MERGE=true`.
-
-## Local production
-
-```sh
-cd template-workflow
-npm ci --ignore-scripts --no-audit --no-fund
-npm run build
-npm run produce
-```
-
-Production requires macOS and uses npm latest. Exported files appear under `artifacts/latest/`. For local proxy downloads set `TEMPLATE_HTTP_PROXY=http://127.0.0.1:7897`. See the producer README for explicit development overrides and Gateway bundle export.
-
-## Independence and historical provenance
-
-Normal template production uses the verified npm Claude Code client, this repository's implementation, and our previous published template. It does not fetch Dario templates or code. The implementation and initial baseline were originally imported from Dario; some preserved tool definitions retain that historical origin. Release notes identify Template Workflow as the producer without claiming that every tool was freshly or independently captured. The original license and historical source records remain available.
-
-Manual release dispatch supports `publish=false` for a macOS capture preview. This validates and uploads an Actions artifact without publishing it. The default is true for production and the scheduled caller.
+See `template-workflow/README.md` for files, platform selection, provenance, commands and release details.

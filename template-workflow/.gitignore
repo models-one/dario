@@ -12,3 +12,5 @@ label-target.txt
 issue-881-tripwire.txt
 drift-report.json
 *.credentials.json
+
+capture-observation.json

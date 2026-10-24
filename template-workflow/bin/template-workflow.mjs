@@ -16,7 +16,7 @@ const help = `template-workflow
   produce                     Resolve latest, detect drift, bake/label-sync, verify and export
   export [--out directory] [--source source.json]
                               Export our template after verifying its capture provenance
-Run npm ci && npm run build first. Production capture and export target macOS.
+Run npm ci && npm run build first. Production capture must run on the selected native platform.
 `;
 function value(flag, fallback) {
   const i = args.indexOf(flag);
@@ -42,7 +42,8 @@ async function script(file, argv = [], capture = false) {
     client.resolved_at ||= new Date().toISOString();
     console.error(`[template-workflow] capture client ${client.version}, sha256 ${client.sha256}`);
     env.TEMPLATE_REAL_CLAUDE_BIN = client.path;
-    env.DARIO_CLAUDE_BIN = join(root, 'scripts/claude-loopback.mjs');
+    env.TEMPLATE_NODE_BIN = process.execPath;
+    env.DARIO_CLAUDE_BIN = join(root, process.platform === 'win32' ? 'scripts/claude-loopback.cmd' : 'scripts/claude-loopback.mjs');
     if (command === 'capture') {
       const { prepareCaptureBaseline } = await import('../lib/production.mjs');
       const repair = prepareCaptureBaseline(root);
@@ -79,7 +80,10 @@ try {
   if (['help', '--help', '-h'].includes(command)) { console.log(help); }
   else {
     if (!existsSync(join(root, 'dist/live-fingerprint.js'))) throw new Error('Build missing. Run npm ci && npm run build first.');
-    if (['produce', 'capture', 'label-sync'].includes(command) && process.platform !== 'darwin') throw new Error('Template production and label updates require macOS');
+    if (['produce', 'capture', 'label-sync'].includes(command)) {
+      const { TARGET_PLATFORM, NATIVE_PLATFORMS } = await import('../lib/platform.mjs');
+      if (!NATIVE_PLATFORMS.includes(TARGET_PLATFORM) || process.platform !== TARGET_PLATFORM) throw new Error('Template production must run on its target native platform');
+    }
     if (command === 'capture' || command === 'check') {
       const forwarded = args.filter((_, i) => args[i] !== '--cc-version' && args[i - 1] !== '--cc-version');
       process.exitCode = await script('capture-and-bake.mjs', command === 'check' ? ['--check', ...forwarded] : forwarded, true);
@@ -111,7 +115,8 @@ try {
       const raw = readFileSync(resolve(args[0] || join(root, 'src/cc-template-data.json')));
       const t = validateTemplate(raw);
       const { assertTargetTemplate } = await import('../lib/platform.mjs');
-      assertTargetTemplate(t);
+      const proof = existsSync(join(root, 'src/cc-template-provenance.json')) ? JSON.parse(readFileSync(join(root, 'src/cc-template-provenance.json'))) : null;
+      assertTargetTemplate(t, proof?.target_platform);
       console.log(JSON.stringify({ valid: true, cc_version: t._version, schema: t._schemaVersion, bytes: raw.length, sha256: sha256(raw) }, null, 2));
     } else if (command === 'export') {
       for (let i = 0; i < args.length; i++) {

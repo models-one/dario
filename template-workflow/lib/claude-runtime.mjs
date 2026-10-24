@@ -2,9 +2,14 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, existsSync, renameSync, rmSync, openSync, closeSync, chmodSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
 
 function run(bin, args, options = {}) {
+  if (bin === 'npm' && process.platform === 'win32') {
+    const cli = process.env.npm_execpath || join(dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');
+    if (!existsSync(cli)) throw new Error('Cannot locate npm-cli.js; launch through npm run on Windows');
+    args = [cli, ...args]; bin = process.execPath;
+  }
   const result = spawnSync(bin, args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 180000, ...options });
   if (result.error || result.status !== 0) throw new Error(`${bin} ${args[0]} failed (${result.error?.code || result.status}); client preparation stopped`);
   return result.stdout;
@@ -30,7 +35,7 @@ export function installClientArchive({ archive, dist, version, platform, target,
   const archiveBytes = readFileSync(archive);
   const [algorithm, expected] = String(dist.integrity).split('-');
   if (algorithm !== 'sha512' || createHash('sha512').update(archiveBytes).digest('base64') !== expected) throw new Error('Claude package integrity mismatch');
-  const names = run('tar', ['-tf', archive]).trim().split('\n');
+  const names = run('tar', ['-tf', archive]).trim().split(/\r?\n/);
   const binaries = names.filter((name) => /^package\/(?:bin\/)?claude(?:\.exe)?$/.test(name));
   if (binaries.length !== 1) throw new Error('Claude archive must contain exactly one expected native binary');
   mkdirSync(target, { recursive: true });
@@ -99,4 +104,12 @@ export function prepareClaude({ version = process.env.TEMPLATE_CC_VERSION || 'la
     }
     return verifyPreparedClient({ ...client, path: join(destination, platform.startsWith('win32-') ? 'claude.exe' : 'claude') });
   } finally { rmSync(scratch, { recursive: true, force: true }); }
+}
+
+export function resolveLatestClaudeVersion() {
+  const env = { ...process.env };
+  if (env.TEMPLATE_HTTP_PROXY) env.npm_config_proxy = env.TEMPLATE_HTTP_PROXY;
+  const version = JSON.parse(run('npm', ['view', '@anthropic-ai/claude-code@latest', 'version', '--json', '--registry=https://registry.npmjs.org'], { env }));
+  if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) throw new Error('npm did not return an exact latest version');
+  return { version, resolved_at: new Date().toISOString() };
 }

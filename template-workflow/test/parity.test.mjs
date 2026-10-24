@@ -69,7 +69,7 @@ async function bake(kind, { check = false, baseline = canonical, mutate, failFam
   });
   let code = 0;
   try { await entry.evaluate(); } catch (error) { if (!(error instanceof Exit)) throw error; code = error.code; }
-  return { code, files: [...files].sort(([a], [b]) => a.localeCompare(b)), calls };
+  return { code, files: [...files].filter(([name]) => !name.endsWith('/capture-observation.json')).sort(([a], [b]) => a.localeCompare(b)), calls };
 }
 
 test('deferred preservation matches official Dario: 35 previous plus 12 observed yields 37', () => {

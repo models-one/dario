@@ -1,78 +1,65 @@
-# Template Workflow for macOS
+# Template Workflow
 
-Template Workflow is a macOS Claude Code template producer maintained in this repository. Its capture, cleaning, tool preservation, drift detection and release implementation is included locally. Normal production requires no Dario service, repository access or future source releases.
+Template Workflow produces four independently versioned outputs: the total template package, macOS, Windows and Linux. Capture, cleaning, tool preservation, drift detection and publication are maintained in this repository. Normal production requires no Dario service, repository access or future source release. Original source/license records and development fixtures remain locally available.
 
-The implementation was originally extracted from Dario, and the initial tool baseline included definitions from an imported Dario template. Retained definitions may still trace back to that initial baseline; independently running the producer does not mean every tool has been independently recaptured. Historical source attribution and the original license remain in this repository. Fixtures under `test/reference/` are local development test inputs.
+## Automated production
 
-## Production
+One GitHub Actions run resolves npm `@anthropic-ai/claude-code@latest` once and passes the exact version to three native capture jobs:
+
+- macOS: `macos-latest`, native `darwin-*` client.
+- Windows: `windows-latest`, native `win32-*` client.
+- Linux: `ubuntu-latest`, native `linux-*` client.
+
+Each job verifies npm package integrity, binary digest and reported version. It restores only its own platform's previous release, captures the base prompt and the three model-family variants through a local collector, scrubs host details, merges eligible historical tools, checks drift and rebakes or synchronizes labels when required. A missing platform baseline triggers a migration from the checked-in owned baseline, clearing old prompt variants and A/B history so each family must be captured on the new platform.
+
+`capture-observation.json` records tool names and model outcomes actually observed. `artifacts/current-check.json` binds that evidence, the exact client, template digest and workflow run. These contain no account credentials or raw requests. A failed or retained-from-failure model capture cannot qualify a four-platform publication batch.
+
+The capture matrix uses placeholder authentication against its loopback collector. It needs no personal Claude login or paid inference request. This is not an authenticated official-endpoint equivalence certificate.
+
+## Four release products
+
+- `template-macos-cc-<version>-<digest>`: macOS schema 3 template.
+- `template-windows-cc-<version>-<digest>`: Windows schema 3 template.
+- `template-linux-cc-<version>-<digest>`: Linux schema 3 template.
+- `template-all-cc-<version>-<bundle-digest>`: total package, published last and marked GitHub Latest.
+
+Every native release contains `cc-template-data.json`, `metadata.json`, `provenance.json` and `SHA256SUMS`. Metadata and provenance identify `target_platform` as `darwin`, `win32` or `linux`. macOS/Linux artifacts reject names currently classified Windows-only: PowerShell, Glob and Grep. Windows definitions must be observed or come from its own prior baseline; they are not supplied by fetching an external template.
+
+The total release contains the standard four files plus:
+
+- `cc-template-macos.json`, `cc-template-windows.json`, `cc-template-linux.json`: byte-identical copies of this batch's verified native outputs.
+- `platforms.json`: platform-to-file mapping, component digests, metadata, original capture provenance and current-run observation evidence.
+
+The total `cc-template-data.json` is a backward-compatible schema 3 union. It uses the Linux base/model prompts and merges tool names across the three inputs. For a shared tool, a definition observed in this batch takes precedence over preserved history; ties use Linux, macOS, Windows order. Differing definitions are recorded in `metadata.json.tool_conflicts`, and `provenance.json.tool_sources` identifies each selected tool. Consumers requiring a native platform's exact prompt and definitions must select that platform file; the union is not one raw native request body.
+
+The total tag hashes both its union and all three native template digests. A platform-only prompt change therefore creates a new total release even when the Linux-default union is unchanged. Before any release is created, all four outputs are validated together for version, platform, checksums and a shared workflow batch. GitHub does not provide a four-release transaction: native releases publish first, total publishes last. Publication is idempotent so a failed publication job can be rerun safely.
+
+## Historical definitions and independence
+
+The implementation and initial baseline were originally imported from Dario. Some retained tool definitions can still trace to that initial baseline. A capture updates definitions it observes; platform-compatible interactive, configuration-scoped and deferred tools may be retained when absent. The producer blocks unclassified tool loss instead of silently shrinking the inventory. Not every tool in a release is freshly captured, and a no-drift result does not prove that unobserved tools are current.
+
+Normal production restores only our releases or our checked-in baseline. It does not download another project's template. Source imports are optional manual maintenance, never part of scheduled production. Original notices and `upstream-snapshot.json` document historical source attribution and local file integrity.
+
+## Commands
 
 ```sh
 npm ci --ignore-scripts --no-audit --no-fund
 npm run build
 npm run produce
-```
-
-`produce` requires macOS and always resolves the official npm `latest` version once at the start of the run. It downloads the exact native macOS client for the runner architecture, verifies the npm package integrity, binary digest and reported version, then uses that same client for the whole run. A failed download or capture fails the job; it does not fall back to an old client or an upstream template.
-
-The production sequence is:
-
-1. Restore our last published macOS template and provenance. A verified checked-in macOS baseline is preferred over legacy releases when no macOS release exists yet.
-2. Resolve and verify the latest Claude Code client.
-3. Capture the base prompt and model-family variants against a local loopback endpoint.
-4. Apply scrubbing, macOS tool preservation and drift classification against our previous macOS baseline.
-5. Rebake on structural drift; sync version labels only after a matching live shape check; retain the existing artifact when there is no drift.
-6. Verify the template contract, variants, scrubbed content, client version and capture provenance.
-7. Export and publish our artifact with its checksums and provenance.
-
-The producer preserves interactive, configuration-scoped and deferred tools from the previous baseline when a macOS capture does not expose them. Other-platform tools are removed from the baseline and blocked at export; the current Windows-only classification contains `PowerShell`, `Glob` and `Grep`. A produced template therefore combines freshly observed content with those preserved definitions. The provenance records the previous baseline digest. Unclassified tool loss is a failure; production does not bypass tool-drop, missing-variant or macOS host checks.
-
-`src/cc-template-data.json` is the producer's macOS baseline. The current checked-in baseline was captured on a hosted Apple Silicon macOS runner using the verified native Claude Code 2.1.310 client (34 tools and three model variants). `src/cc-template-provenance.json` binds it to a successful native macOS capture or verified label-only update. Export requires `target_platform=darwin` and a verified `darwin-*` client. During a legacy platform migration, the producer removes other-platform tools and discards all prior model variants and A/B shape history. All model families must then be captured on macOS before a new artifact can be exported; a Linux artifact is never relabeled as macOS.
-
-Historical platform-neutral definitions can still be retained. A macOS template is a reusable inventory for macOS scenes, not a claim that every retained tool was observed in the current non-interactive capture, nor an authenticated official-endpoint parity certificate.
-
-## Delivery
-
-Default `npm run export` exports our own verified template to `artifacts/latest/`:
-
-- `cc-template-data.json`: the schema 3 template, unchanged by the exporter.
-- `metadata.json`: version, tool/variant counts and digest; `target_platform=darwin` and `origin.type=template-workflow`.
-- `provenance.json`: target platform, actual native package/architecture, resolved client version/digest, previous baseline digest, implementation commit and capture run.
-- `SHA256SUMS`: checksums for the three files above.
-
-`npm run export -- --source /path/to/source.json` additionally emits the existing Gateway `cc-template-bundle/v1` envelope. Its embedded template bytes and digest are identical to the raw artifact. The source object's CC version must match the template.
-
-Export requires matching capture provenance. It neither loads nor compares a Dario official template. `--observed` remains an alias for the same production export for compatibility. There is no official-snapshot export mode.
-
-## GitHub Actions
-
-Active workflows live in the parent repository's `.github/workflows/`:
-
-- `template-workflow-ci.yml`: Node 22/24 on macOS, implementation integrity and regression tests, including controlled capture and export tests.
-- `template-workflow-capture.yml`: hourly at :41, calls the complete production/release workflow.
-- `template-workflow-release.yml`: runs on producer changes, manual dispatch or the hourly caller; restores our last release, captures latest, validates and publishes.
-- `template-workflow-npm-drift.yml`: hourly npm drift detection; dispatches capture when needed.
-- `template-workflow-liveness.yml`: every two hours, checks production watcher health.
-- `template-workflow-upstream-sync.yml`: optional source-import tool, available only through an explicit manual dispatch. It has no schedule and is not called by production.
-
-Capture/release uses a fresh GitHub-hosted macOS runner with Claude's default `~/.claude` configuration path so the project-path scrubbing rules apply. Requests used for capture go to the loopback collector, with a placeholder API key; a personal Claude login or paid model request is not required. `GITHUB_TOKEN` with Contents write permission can publish the artifact; production does not depend on creating or merging a PR.
-
-Releases use `template-macos-cc-<CC version>-<template digest>` tags. An unchanged template reuses its immutable release after checking its files. A rebake or label update produces a new tag. Normal restoration accepts only this macOS namespace with matching provenance and checksums. A previously produced generic release can bootstrap a fresh macOS capture only when no macOS release or verified checked-in macOS baseline exists. It is never directly exported. Legacy official-snapshot releases are never restored.
-
-For code-maintenance PRs, configure organization-approved `CC_DRIFT_BOT_PAT`. Without it, npm drift still dispatches production and upstream changes are reported as issues. `TEMPLATE_AUTO_MERGE=true` applies only to optional maintenance PRs.
-
-## Development
-
-```sh
-npm test
-npm run prepare:claude
-npm run check
-npm run capture
 npm run export
-npm run verify:source
 ```
 
-`capture`, `produce` and `label-sync` require macOS. Failed direct captures restore the previous baseline and provenance. `check` is non-destructive: exit 0 means a match, 1 infrastructure failure, 2 structural drift and 3 label-only drift. `label-sync <version>` requires a matching live check. Standalone capture/check support `--cc-version`, `TEMPLATE_CC_VERSION` and `TEMPLATE_CLAUDE_BIN` for explicit historical/debug runs; the production `produce` entry point always uses npm latest. `TEMPLATE_HTTP_PROXY` configures npm/Git downloads. Keep a local proxy such as port 7897 local to that machine; GitHub runners use their own network.
+`produce` defaults to the host platform, which must be macOS, Windows or Linux. `TEMPLATE_TARGET_PLATFORM=darwin|win32|linux` can select a native target, but capture cannot impersonate another OS. Local production resolves latest; the workflow uses `TEMPLATE_RESOLVED_CC_VERSION` from its shared resolution job. `TEMPLATE_HTTP_PROXY` configures downloads, such as a local proxy on port 7897.
 
-`upstream-snapshot.json` records historical source attribution and local file hashes. `verify:source` checks those local files and does not contact upstream. Optional source imports are deliberate maintainer actions; they never write `src/cc-template-data.json` or its provenance. Original Dario fixtures and replay tests are development-only; their bytes do not determine the production artifact. The declared source adapter changes the bake-host guard to macOS.
+`export` validates the captured platform in provenance and copies the raw template unchanged into `artifacts/latest/`; export itself can run on any OS. `export --source source.json` additionally writes the existing Gateway `cc-template-bundle/v1` envelope without altering the inner bytes. No custom platform field is added to the schema 3 template itself.
 
-To validate a branch before publication, dispatch `template-workflow-release.yml` with `publish=false`. It runs the same macOS capture and validation, uploads the generated files as an Actions artifact, and skips the release publication step. Scheduled and normal production runs publish by default.
+## Workflows and checks
+
+- `template-workflow-release.yml`: resolve latest, capture on three native runners, aggregate, test and publish all four releases.
+- `template-workflow-capture.yml`: hourly at :41, invokes the complete release workflow.
+- `template-workflow-ci.yml`: Node 22/24 on macOS and Linux; capture/merge/parity/provenance/aggregate regression tests.
+- `template-workflow-npm-drift.yml`: npm monitoring and production dispatch on drift.
+- `template-workflow-liveness.yml`: scheduled capture health monitoring.
+- `template-workflow-upstream-sync.yml`: optional manual source import; no schedule.
+
+Manual release dispatch accepts `publish=false` to exercise all native captures and aggregation, upload Actions artifacts, and skip release publication. Windows is validated by its real native capture job; POSIX mock-client tests run on macOS/Linux. `verify:source` checks local files only. Maintenance PRs require an organization-approved bot token; normal four-product publication uses `GITHUB_TOKEN` and does not depend on PR creation.
