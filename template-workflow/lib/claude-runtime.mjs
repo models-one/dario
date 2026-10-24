@@ -5,6 +5,13 @@ import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 
 function run(bin, args, options = {}) {
+  // Git Bash's GNU tar treats D:\\... as a remote archive specification.
+  // Windows' bsdtar handles native drive paths and binary extraction.
+  if (bin === 'tar' && process.platform === 'win32') {
+    const windowsRoot = process.env.SystemRoot || process.env.SYSTEMROOT;
+    if (!windowsRoot) throw new Error('Windows SystemRoot is required to locate native tar.exe');
+    bin = join(windowsRoot, 'System32', 'tar.exe');
+  }
   if (bin === 'npm' && process.platform === 'win32') {
     const cli = process.env.npm_execpath || join(dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');
     if (!existsSync(cli)) throw new Error('Cannot locate npm-cli.js; launch through npm run on Windows');
