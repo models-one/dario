@@ -24,7 +24,7 @@ The production sequence is:
 
 Dario preserves classified platform, interactive, configuration-scoped and deferred tools from the previous baseline when a capture does not expose them. A produced template therefore combines freshly observed content with those preserved definitions. The provenance records the previous baseline digest. Unclassified tool loss is a failure; production does not pass any tool-drop, missing-variant or non-Linux bypass flags.
 
-`src/cc-template-data.json` is the producer's baseline. `src/cc-template-provenance.json` binds it to a successful capture or verified label-only update. A bootstrap baseline without provenance can never be exported directly: a fresh capture and bake are mandatory. Legacy hosted-config paths are rejected from production output; affected cached variants must be recaptured.
+`src/cc-template-data.json` is the producer's baseline. `src/cc-template-provenance.json` binds it to a successful capture or verified label-only update. The checked-in baseline is our CI-produced 2.1.310 template with capture provenance. A bootstrap baseline without provenance can never be exported directly: a fresh capture and bake are mandatory. Legacy hosted-config paths are rejected from production output; affected cached variants must be recaptured.
 
 ## Delivery
 

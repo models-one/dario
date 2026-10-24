@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Seed the repository with our verified hosted capture of Claude Code 2.1.310 and its production provenance.
+
 - Publish our own latest-client captures with validated provenance; production no longer exports or compares an official Dario snapshot.
 - Run capture and release on hosted Linux, restore only our produced baselines, and keep source synchronization separate from production data.
 
