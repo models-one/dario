@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -16,7 +16,7 @@ const help = `template-workflow
   produce                     Resolve latest, detect drift, bake/label-sync, verify and export
   export [--out directory] [--source source.json]
                               Export our template after verifying its capture provenance
-Run npm ci && npm run build first. Capture/bake follows Dario's Linux guard.
+Run npm ci && npm run build first. Production capture and export target macOS.
 `;
 function value(flag, fallback) {
   const i = args.indexOf(flag);
@@ -27,7 +27,12 @@ function value(flag, fallback) {
 async function script(file, argv = [], capture = false) {
   const env = { ...process.env };
   let client;
-  const baseline = capture ? readFileSync(join(root, 'src/cc-template-data.json')) : null;
+  let baseline = capture ? readFileSync(join(root, 'src/cc-template-data.json')) : null;
+  const original = baseline;
+  const proofFile = join(root, 'src/cc-template-provenance.json');
+  const originalProof = existsSync(proofFile) ? readFileSync(proofFile) : null;
+  let committed = false;
+  try {
   if (capture) {
     const { prepareClaude, verifyPreparedClient } = await import('../lib/claude-runtime.mjs');
     client = env.TEMPLATE_PREPARED_CC
@@ -38,6 +43,12 @@ async function script(file, argv = [], capture = false) {
     console.error(`[template-workflow] capture client ${client.version}, sha256 ${client.sha256}`);
     env.TEMPLATE_REAL_CLAUDE_BIN = client.path;
     env.DARIO_CLAUDE_BIN = join(root, 'scripts/claude-loopback.mjs');
+    if (command === 'capture') {
+      const { prepareCaptureBaseline } = await import('../lib/production.mjs');
+      const repair = prepareCaptureBaseline(root);
+      if (repair && !env.TEMPLATE_BASELINE_REPAIR) env.TEMPLATE_BASELINE_REPAIR = JSON.stringify(repair);
+      baseline = readFileSync(join(root, 'src/cc-template-data.json'));
+    }
   }
   const child = spawn(process.execPath, [join(root, 'scripts', file), ...argv], { cwd: root, env, stdio: 'inherit' });
   const signals = ['SIGINT', 'SIGTERM'];
@@ -48,19 +59,27 @@ async function script(file, argv = [], capture = false) {
   });
   if (capture && command === 'capture' && code === 0) {
     const { recordProduction } = await import('../lib/production.mjs');
-    recordProduction(root, { raw: readFileSync(join(root, 'src/cc-template-data.json')), baseline, client, operation: 'capture', upstreamCommit: JSON.parse(readFileSync(join(root, 'upstream-snapshot.json'))).commit });
+    recordProduction(root, { raw: readFileSync(join(root, 'src/cc-template-data.json')), baseline, client, operation: 'capture', env, upstreamCommit: JSON.parse(readFileSync(join(root, 'upstream-snapshot.json'))).commit });
   }
   if (capture && command === 'check') {
     const { sha256 } = await import('../lib/template.mjs');
     mkdirSync(join(root, 'artifacts'), { recursive: true });
     writeFileSync(join(root, 'artifacts/check.json'), JSON.stringify({ code, baseline_sha256: sha256(baseline), client }));
   }
+  committed = code === 0;
   return code;
+  } finally {
+    if (capture && command === 'capture' && !committed) {
+      writeFileSync(join(root, 'src/cc-template-data.json'), original);
+      if (originalProof) writeFileSync(proofFile, originalProof); else rmSync(proofFile, { force: true });
+    }
+  }
 }
 try {
   if (['help', '--help', '-h'].includes(command)) { console.log(help); }
   else {
     if (!existsSync(join(root, 'dist/live-fingerprint.js'))) throw new Error('Build missing. Run npm ci && npm run build first.');
+    if (['produce', 'capture', 'label-sync'].includes(command) && process.platform !== 'darwin') throw new Error('Template production and label updates require macOS');
     if (command === 'capture' || command === 'check') {
       const forwarded = args.filter((_, i) => args[i] !== '--cc-version' && args[i - 1] !== '--cc-version');
       process.exitCode = await script('capture-and-bake.mjs', command === 'check' ? ['--check', ...forwarded] : forwarded, true);
@@ -91,6 +110,8 @@ try {
       const { validateTemplate, sha256 } = await import('../lib/template.mjs');
       const raw = readFileSync(resolve(args[0] || join(root, 'src/cc-template-data.json')));
       const t = validateTemplate(raw);
+      const { assertTargetTemplate } = await import('../lib/platform.mjs');
+      assertTargetTemplate(t);
       console.log(JSON.stringify({ valid: true, cc_version: t._version, schema: t._schemaVersion, bytes: raw.length, sha256: sha256(raw) }, null, 2));
     } else if (command === 'export') {
       for (let i = 0; i < args.length; i++) {

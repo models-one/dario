@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'node
 import { resolve, join } from 'node:path';
 import { VARIANT_FAMILIES, promptVariantsOf } from '../dist/live-fingerprint.js';
 import { findUserPathHits } from '../dist/scrub-template.js';
+import { TARGET_PLATFORM, assertTargetTemplate } from './platform.mjs';
 
 export const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 export function validateTemplate(raw) {
@@ -44,13 +45,17 @@ export function exportTemplate({ templatePath, out, source, provenance, origin =
   const t = validateTemplate(raw);
   if (origin.type === 'dario-official') throw new Error('Official snapshot delivery is not supported');
   if (provenance && (provenance.producer !== 'template-workflow' || provenance.template?.sha256 !== sha256(raw) || provenance.template?.cc_version !== t._version)) throw new Error('Template does not match its capture provenance');
+  if (provenance) {
+    if (provenance.target_platform !== TARGET_PLATFORM || !provenance.client?.platform?.startsWith('darwin-')) throw new Error('Only verified macOS captures can be exported');
+    assertTargetTemplate(t);
+  }
   if (provenance) origin = { type: 'template-workflow', operation: provenance.operation, upstream_commit: provenance.implementation.upstream_commit, run_url: provenance.run.url };
   // Validate every input before writing any deliverable.
   const bundle = source ? makeBundle(raw, source) : null;
   const target = resolve(out);
   mkdirSync(target, { recursive: true });
   writeFileSync(join(target, 'cc-template-data.json'), raw);
-  const metadata = { format: 'template-workflow-artifact/v1', schema_version: 3, cc_version: t._version, captured_at: t._captured, bytes: raw.length, sha256: sha256(raw), tools: t.tools.length, variants: Object.keys(promptVariantsOf(t)), origin };
+  const metadata = { format: 'template-workflow-artifact/v1', ...(provenance ? { target_platform: TARGET_PLATFORM } : {}), schema_version: 3, cc_version: t._version, captured_at: t._captured, bytes: raw.length, sha256: sha256(raw), tools: t.tools.length, variants: Object.keys(promptVariantsOf(t)), origin };
   writeFileSync(join(target, 'metadata.json'), JSON.stringify(metadata, null, 2) + '\n');
   let sums = `${metadata.sha256}  cc-template-data.json\n`;
   if (provenance) {

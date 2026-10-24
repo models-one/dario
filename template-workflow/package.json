@@ -1,6 +1,6 @@
 {
   "name": "template-workflow",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Standalone Dario Claude Code template capture, scrub, drift detection and automation",

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Target macOS exclusively: verify native darwin client provenance, isolate macOS releases, remove other-platform tools, and recapture all variants when migrating from Linux.
+- Run hosted capture and CI on macOS; support capture previews before publishing.
+
 - Identify Template Workflow as the producer in release notes, explicitly describe retained baseline definitions, and make third-party source imports manual-only.
 
 - Seed the repository with our verified hosted capture of Claude Code 2.1.310 and its production provenance.

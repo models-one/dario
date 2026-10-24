@@ -7,7 +7,16 @@ on:
       - '.github/workflows/template-workflow-release.yml'
       - '.github/workflows/template-workflow-capture.yml'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified macOS template
+        type: boolean
+        default: true
   workflow_call:
+    inputs:
+      publish:
+        type: boolean
+        default: true
 permissions:
   contents: write
 concurrency:
@@ -16,7 +25,7 @@ concurrency:
 jobs:
   produce-and-release:
     if: github.repository == 'models-one/dario'
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 30
     defaults:
       run:
@@ -43,6 +52,7 @@ jobs:
           TEMPLATE_CC_CACHE_DIR: ${{ runner.temp }}/template-claude
         run: npm run produce
       - name: Publish our verified template
+        if: github.event_name == 'push' || inputs.publish
         run: node scripts/production-release.mjs publish
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -8,7 +8,10 @@ import { fileURLToPath } from 'node:url';
 import { exportTemplate, makeBundle, sha256, validateTemplate } from '../lib/template.mjs';
 import { checkOpenRebake } from '../scripts/automation.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
-const seed = readFileSync(new URL('fixtures/seed-template.json', import.meta.url));
+const originalSeed = JSON.parse(readFileSync(new URL('./fixtures/seed-template.json', import.meta.url)));
+originalSeed.tools = originalSeed.tools.filter((tool) => !['PowerShell', 'Glob', 'Grep'].includes(tool.name));
+originalSeed.tool_names = originalSeed.tools.map((tool) => tool.name);
+const seed = Buffer.from(JSON.stringify(originalSeed, null, 2) + '\n');
 const source = (t) => ({ capture_run_id: 'synthetic-test-run', environment_id: 'synthetic-test-env', scene_revision: 'test-1', comparison_context_id: 'test', source_sequence: '1', cc_version: t._version, dario_commit: 'c528850aae26f1de845f364c430aeeb5b8d733ab' });
 
 test('export preserves the original artifact bytes and Gateway bundle digest', (t) => {
@@ -41,6 +44,8 @@ test('real CLI capture/check/label/export chain with a controlled Claude process
   const work = mkdtempSync(join(tmpdir(), 'template-cli-')); t.after(() => rmSync(work, { recursive: true, force: true }));
   cpSync(root, work, { recursive: true, filter: (file) => !['node_modules', '.git', 'artifacts'].some((name) => file === resolve(root, name) || file.startsWith(resolve(root, name) + '/')) });
   writeFileSync(join(work, 'src/cc-template-data.json'), seed); writeFileSync(join(work, 'dist/cc-template-data.json'), seed);
+  writeFileSync(join(work, 'test/fixtures/seed-template.json'), seed);
+  rmSync(join(work, 'src/cc-template-provenance.json'), { force: true });
   const captures = join(work, 'captures.jsonl');
   const env = { ...process.env, TEMPLATE_CLAUDE_BIN: join(work, 'test/fixtures/mock-claude.mjs'), TEMPLATE_TEST_TEMPLATE: join(work, 'test/fixtures/seed-template.json'), TEMPLATE_TEST_CAPTURES: captures };
   const cli = (args, extra = {}) => spawnSync(process.execPath, [join(work, 'bin/template-workflow.mjs'), ...args], { cwd: work, env: { ...env, ...extra, TEMPLATE_CC_VERSION: extra.TEMPLATE_TEST_VERSION || JSON.parse(seed)._version }, encoding: 'utf8', timeout: 70000 });
@@ -54,9 +59,9 @@ test('real CLI capture/check/label/export chain with a controlled Claude process
   r = cli(['check'], { TEMPLATE_TEST_MUTATION: 'shape' }); assert.equal(r.status, 2, r.stderr);
   assert.ok(existsSync(join(work, 'drift-summary.md')));
   r = cli(['check'], { TEMPLATE_TEST_VERSION: '2.1.295' }); assert.equal(r.status, 1, r.stderr);
-  r = cli(['capture', '--allow-non-linux-bake'], { TEMPLATE_TEST_MUTATION: 'tool-drop' }); assert.equal(r.status, 4, r.stderr);
+  r = cli(['capture'], { TEMPLATE_TEST_MUTATION: 'tool-drop' }); assert.equal(r.status, 4, r.stderr);
   assert.deepEqual(readFileSync(join(work, 'src/cc-template-data.json')), seed);
-  r = cli(['capture', '--allow-non-linux-bake'], { TEMPLATE_TEST_MUTATION: 'shape' }); assert.equal(r.status, 0, r.stderr);
+  r = cli(['capture'], { TEMPLATE_TEST_MUTATION: 'shape' }); assert.equal(r.status, 0, r.stderr);
   const baked = JSON.parse(readFileSync(join(work, 'src/cc-template-data.json')));
   assert.match(baked.system_prompt, /A new canonical instruction\./); assert.equal(baked._source, 'bundled');
   assert.deepEqual(baked.tool_names, baked.tools.map((tool) => tool.name));
@@ -71,6 +76,7 @@ test('real CLI capture/check/label/export chain with a controlled Claude process
   r = cli(['export', '--out', join(work, 'default-output')]); assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(readFileSync(join(work, 'default-output/cc-template-data.json')), readFileSync(join(work, 'src/cc-template-data.json')));
   assert.equal(JSON.parse(readFileSync(join(work, 'default-output/metadata.json'))).origin.type, 'template-workflow');
+  assert.equal(JSON.parse(readFileSync(join(work, 'default-output/metadata.json'))).target_platform, 'darwin');
   assert.equal(JSON.parse(readFileSync(join(work, 'default-output/provenance.json'))).operation, 'label-sync');
   r = cli(['export', '--template', join(work, 'src/cc-template-data.json')]); assert.equal(r.status, 1);
   mkdirSync(join(work, 'reference'), { recursive: true });

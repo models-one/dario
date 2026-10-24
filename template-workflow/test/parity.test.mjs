@@ -47,7 +47,7 @@ async function bake(kind, { check = false, baseline = canonical, mutate, failFam
   const basePath = '/fixed-replay';
   const files = new Map([[`${basePath}/src/cc-template-data.json`, JSON.stringify(baseline, null, 2) + '\n']]);
   const calls = [];
-  const proc = { env: {}, argv: ['node', 'capture-and-bake.mjs', ...(check ? ['--check'] : [])], platform: 'linux', exit: (code) => { throw new Exit(code); } };
+  const proc = { env: {}, argv: ['node', 'capture-and-bake.mjs', ...(check ? ['--check'] : [])], platform: official ? 'linux' : 'darwin', exit: (code) => { throw new Exit(code); } };
   const context = vm.createContext({ process: proc, console: { error() {}, log() {} }, structuredClone, Buffer, Date });
   const capturedLive = { ...live, findInstalledCC: () => ({ path: '/synthetic/claude', version: canonical._version }), captureLiveTemplateAsync: async () => {
     const model = proc.env.ANTHROPIC_MODEL;

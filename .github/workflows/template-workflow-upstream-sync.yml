@@ -17,7 +17,7 @@ concurrency:
 jobs:
   upstream-sync:
     if: github.repository == 'models-one/dario'
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 20
     permissions:
       actions: write

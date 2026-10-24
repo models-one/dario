@@ -62,7 +62,6 @@ const OUT = join(repoRoot, 'src/cc-template-data.json');
 
 const CHECK_MODE = process.argv.includes('--check');
 const ALLOW_OLDER_CC = process.argv.includes('--allow-older-cc');
-const ALLOW_NON_LINUX = process.argv.includes('--allow-non-linux-bake');
 const ALLOW_MISSING_VARIANT = process.argv.includes('--allow-missing-variant');
 
 function log(msg) {
@@ -165,36 +164,11 @@ if (isOlderCCVersion(captured._version, prev._version)) {
 }
 
 
-// Bake host must be Linux, because CC's prompt is not host-portable.
-//
-// The sonnet-5 variant names the tools that exist where the capture ran: a
-// Windows host yields `, Glob, Grep` and `the Glob or Grep`, a Linux host yields
-// `\`find\` or \`grep\` via the Bash tool`. Six bytes, in one slot, and every other
-// slot byte-identical. So a Windows bake and CI's Linux bake each report the
-// other as drift and re-bake forever — dario#854 -> #860 was the same disease
-// through the path channel, #856 through the OS/arch header channel, and this is
-// the third channel: prose that mentions the tool list.
-//
-// Unlike those two, this one cannot be normalised away. The correct text depends
-// on which tools the caller actually has, which the bundle cannot know, and
-// rewriting CC's prose would be inventing wire shape rather than replaying it.
-// PLATFORM_ONLY_TOOLS already unions the tools ARRAY across platforms; nothing
-// can union a sentence.
-//
-// So the fix is procedural: CI bakes on Linux (cc-drift-template-watch, which
-// also pins the OAuth sole-refresher), and a bake from anywhere else has to be
-// deliberate. --check is deliberately NOT gated — detecting drift from any
-// platform is useful and harmless; only WRITING the bundle is restricted.
-if (!CHECK_MODE && process.platform !== 'linux') {
-  if (ALLOW_NON_LINUX) {
-    log(`warning: baking on ${process.platform}, not linux — proceeding because --allow-non-linux-bake was passed.`);
-    log('warning: expect CI to re-bake this bundle on its next drift check (see the sonnet-5 variant note in this file).');
-  } else {
-    log(`error: refusing to write the bundle from ${process.platform}. CC's prompt names the tools available on the bake host, so a non-Linux bundle ping-pongs with CI's Linux bake indefinitely.`);
-    log('error: dispatch the cc-drift-template-watch workflow instead — it bakes on Linux and pins the OAuth sole-refresher.');
-    log('error: pass --allow-non-linux-bake for a deliberate local bake, or use --check to detect drift without writing.');
-    process.exit(1);
-  }
+// This producer publishes macOS templates. Checks may run elsewhere, but
+// a production bake must come from the native macOS client on a macOS host.
+if (!CHECK_MODE && process.platform !== 'darwin') {
+  log(`error: refusing to bake a macOS template from ${process.platform}. Run the macOS capture workflow.`);
+  process.exit(1);
 }
 
 // Preserve other-platform tools from the previous bundle so the baked file
