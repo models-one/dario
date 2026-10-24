@@ -34,7 +34,7 @@ jobs:
           cache-dependency-path: template-workflow/package-lock.json
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run build
-      - run: npm run verify:upstream
+      - run: npm run verify:source
       - run: npm test
       - run: npm run verify
       - run: npm run export

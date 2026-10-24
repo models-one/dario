@@ -1,6 +1,8 @@
 # Template workflow
 
-Standalone Claude Code template producer, using Dario's capture, scrub, tool-preservation and drift mechanisms. Production publishes this repository's own output. The Dario template fixtures under `test/reference/` are only development test inputs.
+Template Workflow is a Claude Code template producer maintained in this repository. Its capture, cleaning, tool preservation, drift detection and release implementation is included locally. Normal production requires no Dario service, repository access or future source releases.
+
+The implementation was originally extracted from Dario, and the initial tool baseline included definitions from an imported Dario template. Retained definitions may still trace back to that initial baseline; independently running the producer does not mean every tool has been independently recaptured. Historical source attribution and the original license remain in this repository. Fixtures under `test/reference/` are local development test inputs.
 
 ## Production
 
@@ -17,12 +19,12 @@ The production sequence is:
 1. Restore our last published template and provenance, if one exists.
 2. Resolve and verify the latest Claude Code client.
 3. Capture the base prompt and model-family variants against a local loopback endpoint.
-4. Apply Dario's scrubbing, tool merging/preservation and drift classification against our previous baseline.
+4. Apply this project's scrubbing, tool merging/preservation and drift classification against our previous baseline.
 5. Rebake on structural drift; sync version labels only after a matching live shape check; retain the existing artifact when there is no drift.
 6. Verify the template contract, variants, scrubbed content, client version and capture provenance.
 7. Export and publish our artifact with its checksums and provenance.
 
-Dario preserves classified platform, interactive, configuration-scoped and deferred tools from the previous baseline when a capture does not expose them. A produced template therefore combines freshly observed content with those preserved definitions. The provenance records the previous baseline digest. Unclassified tool loss is a failure; production does not pass any tool-drop, missing-variant or non-Linux bypass flags.
+The producer preserves classified platform, interactive, configuration-scoped and deferred tools from the previous baseline when a capture does not expose them. A produced template therefore combines freshly observed content with those preserved definitions. The provenance records the previous baseline digest. Unclassified tool loss is a failure; production does not pass any tool-drop, missing-variant or non-Linux bypass flags.
 
 `src/cc-template-data.json` is the producer's baseline. `src/cc-template-provenance.json` binds it to a successful capture or verified label-only update. The checked-in baseline is our CI-produced 2.1.310 template with capture provenance. A bootstrap baseline without provenance can never be exported directly: a fresh capture and bake are mandatory. Legacy hosted-config paths are rejected from production output; affected cached variants must be recaptured.
 
@@ -48,9 +50,9 @@ Active workflows live in the parent repository's `.github/workflows/`:
 - `template-workflow-release.yml`: runs on producer changes, manual dispatch or the hourly caller; restores our last release, captures latest, validates and publishes.
 - `template-workflow-npm-drift.yml`: hourly npm drift detection; dispatches capture when needed.
 - `template-workflow-liveness.yml`: every two hours, checks production watcher health.
-- `template-workflow-upstream-sync.yml`: checks Dario implementation updates; updates code and development fixtures only, preserving our production data.
+- `template-workflow-upstream-sync.yml`: optional source-import tool, available only through an explicit manual dispatch. It has no schedule and is not called by production.
 
-Capture/release uses a fresh GitHub-hosted Ubuntu runner with Claude's default `~/.claude` configuration path so Dario's project-path scrubbing rules apply. Requests used for capture go to the loopback collector, with a placeholder API key; a personal Claude login or paid model request is not required. `GITHUB_TOKEN` with Contents write permission can publish the artifact; production does not depend on creating or merging a PR.
+Capture/release uses a fresh GitHub-hosted Ubuntu runner with Claude's default `~/.claude` configuration path so the project-path scrubbing rules apply. Requests used for capture go to the loopback collector, with a placeholder API key; a personal Claude login or paid model request is not required. `GITHUB_TOKEN` with Contents write permission can publish the artifact; production does not depend on creating or merging a PR.
 
 Releases use `template-cc-<CC version>-<template digest>` tags. An unchanged template reuses its immutable release after checking its files. A rebake or label update produces a new tag. Baseline restoration only accepts this namespace, matching provenance and checksums; legacy official-snapshot releases are never restored.
 
@@ -64,9 +66,9 @@ npm run prepare:claude
 npm run check
 npm run capture
 npm run export
-npm run sync:upstream
+npm run verify:source
 ```
 
 `check` is non-destructive: exit 0 means a match, 1 infrastructure failure, 2 structural drift and 3 label-only drift. `label-sync <version>` requires a matching live check. Standalone capture/check support `--cc-version`, `TEMPLATE_CC_VERSION` and `TEMPLATE_CLAUDE_BIN` for explicit historical/debug runs; the production `produce` entry point always uses npm latest. `TEMPLATE_HTTP_PROXY` configures npm/Git downloads. Keep a local proxy such as port 7897 local to that machine; GitHub runners use their own network.
 
-`upstream-snapshot.json` locks the extracted implementation. Upstream synchronization never writes `src/cc-template-data.json` or its provenance. Original Dario fixtures and replay tests are development-only; their bytes do not determine the production artifact.
+`upstream-snapshot.json` records historical source attribution and local file hashes. `verify:source` checks those local files and does not contact upstream. Optional source imports are deliberate maintainer actions; they never write `src/cc-template-data.json` or its provenance. Original Dario fixtures and replay tests are development-only; their bytes do not determine the production artifact.

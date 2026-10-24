@@ -1,7 +1,6 @@
 name: Template Workflow upstream-sync
+# Optional source import, explicitly dispatched by a maintainer. Never scheduled.
 on:
-  schedule:
-    - cron: '23 * * * *'
   workflow_dispatch:
 defaults:
   run:

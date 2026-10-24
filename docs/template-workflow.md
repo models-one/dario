@@ -4,9 +4,9 @@ The producer lives in `template-workflow/`. Its build, dependencies and source l
 
 ## Production path
 
-The scheduled capture workflow calls the release workflow on a GitHub-hosted Ubuntu runner. Every run resolves npm latest once, verifies the native Claude Code client, performs Dario's multi-model capture against a local collector, scrubs and merges tools, detects drift, then rebakes or synchronizes labels as needed. It validates and publishes our generated template.
+The scheduled capture workflow calls the release workflow on a GitHub-hosted Ubuntu runner. Every run resolves npm latest once, verifies the native Claude Code client, performs the producer's multi-model capture against a local collector, scrubs and merges tools, detects drift, then rebakes or synchronizes labels as needed. It validates and publishes our generated template.
 
-Production reads our last published release as its baseline. It never exports an official Dario snapshot. The upstream synchronization job updates implementation code and development fixtures without touching the production baseline.
+Production reads our last published release as its baseline. It never exports an official Dario snapshot. All implementation code and regression fixtures are stored locally. Optional third-party source imports require an explicit manual dispatch and never touch the production baseline.
 
 Published files: `cc-template-data.json`, `metadata.json`, `provenance.json`, `SHA256SUMS`. Their release tag is `template-cc-<version>-<digest>`. The provenance identifies the client binary, baseline digest and capture run. Failed capture, invalid provenance, unexpected tool loss or a version mismatch stops publication.
 
@@ -19,7 +19,7 @@ The initial migration baseline is only an input to tool preservation. If it has 
 - `release`: capture latest, validate and publish on changes or manual dispatch.
 - `npm-drift`: hourly at :00; checks npm and dispatches production on drift.
 - `liveness`: every two hours; checks the capture workflow.
-- `upstream-sync`: hourly at :23; tests implementation updates and prepares an optional maintenance PR.
+- `upstream-sync`: manual-only source maintenance; never scheduled or called by production.
 
 Only this repository (`models-one/dario`) enables the operational schedules. Hosted capture uses a placeholder API key and the local loopback collector; it needs no self-hosted runner or Claude account credentials. The production workflow declares Contents write permission for `GITHUB_TOKEN`.
 
@@ -35,3 +35,7 @@ npm run produce
 ```
 
 Production requires Linux and uses npm latest. Exported files appear under `artifacts/latest/`. For local proxy downloads set `TEMPLATE_HTTP_PROXY=http://127.0.0.1:7897`. See the producer README for explicit development overrides and Gateway bundle export.
+
+## Independence and historical provenance
+
+Normal template production uses the verified npm Claude Code client, this repository's implementation, and our previous published template. It does not fetch Dario templates or code. The implementation and initial baseline were originally imported from Dario; some preserved tool definitions retain that historical origin. Release notes identify Template Workflow as the producer without claiming that every tool was freshly or independently captured. The original license and historical source records remain available.

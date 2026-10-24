@@ -8,7 +8,7 @@ for (const [name, spec] of Object.entries(snapshot.files)) {
   let raw = readFileSync(new URL(name, root));
   let expected = spec.local_sha256;
   if (spec.normalized_sha256) { raw = Buffer.from(raw.toString().replace(/maxTested:\s*'[^']+'/g, "maxTested: 'PINNED'")); expected = spec.normalized_sha256; }
-  if (createHash('sha256').update(raw).digest('hex') !== expected) throw new Error(`Upstream code changed without updating its source record: ${name}`);
+  if (createHash('sha256').update(raw).digest('hex') !== expected) throw new Error(`Imported source changed without updating its local integrity record: ${name}`);
   count++;
 }
-console.log(`Verified ${count} extracted files against Dario ${snapshot.commit}`);
+console.log(`Verified ${count} locally vendored files from recorded source snapshot ${snapshot.commit} (no remote access)`);

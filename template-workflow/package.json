@@ -24,7 +24,8 @@
     "verify:upstream": "node scripts/verify-upstream.mjs",
     "sync:upstream": "node scripts/sync-upstream.mjs",
     "prepare:claude": "node bin/template-workflow.mjs prepare-claude",
-    "produce": "node bin/template-workflow.mjs produce"
+    "produce": "node bin/template-workflow.mjs produce",
+    "verify:source": "node scripts/verify-upstream.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
